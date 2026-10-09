@@ -1,0 +1,147 @@
+--- a/sales/views.py
++++ b/sales/views.py
+@@ -298,6 +298,10 @@
+     se muestra el formulario (ni se permite guardar aunque alguien
+     fuerce el POST), y la venta queda asociada a esa sesión
+     (`Sale.sesion_caja`)."""
++    # Los documentos no se envían al flujo de cobro, ni afectan caja o stock.
++    if request.method == 'POST' and request.POST.get('tipo_documento'):
++        from .pos_documentos import guardar_documento_pos
++        return guardar_documento_pos(request)
+     empresa = obtener_empresa_actual(request)
+     sesion_caja = cashregister_services.caja_abierta_de(request.user, empresa)
+     if sesion_caja is None:
+--- a/templates/sales/sale_form.html
++++ b/templates/sales/sale_form.html
+@@ -4,7 +4,7 @@
+ {% block page_title %}{{ titulo }}{% endblock %}
+ 
+ {% block content %}
+-<div class="pos-intro"><div><span class="pos-eyebrow">PUNTO DE VENTA</span><h1>Crea una nueva venta</h1></div><span class="pos-intro-hint"><i class="bi bi-lightning-charge"></i> F2 Buscar · F9 Cobrar</span></div>
++<div class="pos-intro"><div><span class="pos-eyebrow">PUNTO DE VENTA</span><h1>Crea una nueva venta</h1></div></div>
+ <div class="pos-layout tw-grid tw-grid-cols-1 tw-gap-4 md:tw-grid-cols-pos">
+ <section class="pos-workspace tw-min-w-0" aria-label="Creación de venta">
+ 
+@@ -43,24 +43,24 @@
+             <i class="bi bi-receipt"></i>
+             <span>Venta actual</span>
+         </div>
+-        <div class="erp-pos-shortcuts">
+-            <button type="button" class="erp-pos-shortcut" data-atajo="cliente">
+-                <span class="erp-kbd">F3</span> Cliente
++        <div class="dropdown pos-document-selector">
++            <button type="button" class="btn dropdown-toggle pos-document-toggle" id="posDocumentoSelector"
++                    data-bs-toggle="dropdown" aria-expanded="false">
++                <i class="bi bi-file-earmark-text" aria-hidden="true"></i>
++                <span id="posDocumentoNombre">Cotización</span>
+             </button>
+-            <button type="button" class="erp-pos-shortcut" data-atajo="buscar">
+-                <span class="erp-kbd">F2</span> Buscar
+-            </button>
+-            <button type="button" class="erp-pos-shortcut" data-atajo="codigo">
+-                <span class="erp-kbd">F4</span> Código
+-            </button>
+-            <button type="button" class="erp-pos-shortcut" data-atajo="limpiar">
+-                <span class="erp-kbd">F10</span> Limpiar
+-            </button>
+-            <button type="submit" class="erp-pos-shortcut erp-pos-shortcut-primary">
+-                <span class="erp-kbd erp-kbd-light">F9</span> Facturar
+-            </button>
++            <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="posDocumentoSelector">
++                <li><button type="button" class="dropdown-item" data-pos-documento="remision">Remisión</button></li>
++                <li><button type="button" class="dropdown-item" data-pos-documento="factura_electronica">
++                    Factura Electrónica <span class="pos-document-status {% if 'facturacion' in modulos_activos_codigos %}is-on{% endif %}" aria-hidden="true"></span>
++                    <span class="visually-hidden">{% if 'facturacion' in modulos_activos_codigos %}Módulo activo{% else %}Módulo inactivo{% endif %}</span>
++                </button></li>
++                <li><button type="button" class="dropdown-item" data-pos-documento="cotizacion">Cotización</button></li>
++                <li><button type="button" class="dropdown-item" data-pos-documento="orden_venta">Orden de Venta</button></li>
++            </ul>
+         </div>
+     </div>
++    <input type="hidden" id="posDocumentoTipo" name="tipo_documento" value="cotizacion">
+ 
+     <div class="row g-3 mt-1">
+         <!-- =================== Columna izquierda: catálogo =================== -->
+@@ -74,38 +74,6 @@
+                     <i class="bi bi-upc-scan erp-input-icon-end" title="Lector de código de barras"></i>
+                     <div id="productoResultados" class="list-group position-absolute w-100 shadow erp-dropdown-resultados"
+                          style="display: none;"></div>
+-                </div>
+-
+-                <!-- Accesos rápidos -->
+-                <div class="mb-3">
+-                    <div class="erp-pos-section-label"><i class="bi bi-lightning-charge-fill"></i> Accesos rápidos (atajos)</div>
+-                    <div class="erp-shortcut-grid">
+-                        <button type="button" class="erp-shortcut-btn" data-atajo="buscar">
+-                            <span class="erp-kbd">F2</span>
+-                            <i class="bi bi-search"></i>
+-                            <span>Buscar</span>
+-                        </button>
+-                        <button type="button" class="erp-shortcut-btn" data-atajo="cliente">
+-                            <span class="erp-kbd">F3</span>
+-                            <i class="bi bi-person"></i>
+-                            <span>Cliente</span>
+-                        </button>
+-                        <button type="button" class="erp-shortcut-btn" data-atajo="codigo">
+-                            <span class="erp-kbd">F4</span>
+-                            <i class="bi bi-upc"></i>
+-                            <span>Código</span>
+-                        </button>
+-                        <button type="button" class="erp-shortcut-btn" data-atajo="limpiar">
+-                            <span class="erp-kbd">F10</span>
+-                            <i class="bi bi-trash"></i>
+-                            <span>Limpiar</span>
+-                        </button>
+-                        <button type="submit" class="erp-shortcut-btn">
+-                            <span class="erp-kbd">Ctrl+S</span>
+-                            <i class="bi bi-save"></i>
+-                            <span>Guardar</span>
+-                        </button>
+-                    </div>
+                 </div>
+ 
+                 <!-- Pestañas de categoría -->
+@@ -212,12 +180,28 @@
+                     <dt class="col-7 fw-bold border-top pt-2">Total</dt>
+                     <dd class="col-5 text-end fw-bold fs-5 border-top pt-2 erp-total-a-pagar" id="resumenTotal">$ 0</dd>
+                 </dl>
++                <div id="posDocumentoPanel" class="mt-3">
++                    <div id="posValidezWrap" class="mb-2">
++                        <label for="posFechaValidez" class="form-label small fw-semibold">Válida hasta</label>
++                        <input type="date" id="posFechaValidez" name="fecha_validez" class="form-control">
++                    </div>
++                    <button type="button" class="btn erp-btn-confirmar w-100" id="posGuardarDocumento">Guardar cotización</button>
++                    <div id="posCompartirPanel" class="pos-document-actions mt-2">
++                        <button type="button" class="btn btn-outline-primary" data-pos-action="correo"><i class="bi bi-envelope"></i> Enviar por Correo</button>
++                        <button type="button" class="btn btn-outline-success" data-pos-action="whatsapp"><i class="bi bi-whatsapp"></i> Enviar por WhatsApp</button>
++                        <button type="button" class="btn btn-outline-secondary" data-pos-action="pdf"><i class="bi bi-file-earmark-pdf"></i> PDF / Imprimir</button>
++                    </div>
++                    <p id="posDocumentoMensaje" class="small mt-2 mb-0" role="status" aria-live="polite"></p>
++                </div>
++                <!-- El control legado se conserva oculto para compatibilidad de scripts. -->
++                <div hidden>
+                 <button type="button" class="btn erp-btn-confirmar w-100 mt-3" id="btnGuardar"
+                         data-bs-toggle="modal" data-bs-target="#modalConfirmarVenta">
+                     <i class="bi bi-cart-check-fill"></i>
+                     <span class="d-block">Cobrar</span>
+                     <small class="d-block fw-normal opacity-75">Confirmar pago y registrar venta (F9)</small>
+                 </button>
++                </div>
+                 <a href="{% url 'sales:sale_list' %}" class="btn btn-outline-secondary w-100 mt-2">Cancelar</a>
+             </div>
+         </div>
+@@ -512,12 +496,14 @@
+ {% block extra_css %}
+ <link href="{% static 'css/pos.css' %}" rel="stylesheet">
+ <link href="{% static 'css/pos_layout.css' %}" rel="stylesheet">
++<link href="{% static 'css/pos_documentos.css' %}" rel="stylesheet">
+ {% endblock %}
+ 
+ {% block extra_js %}
+ <script src="{% static 'js/pos_layout.js' %}"></script>
+ {% if not sin_caja_abierta %}
+ <script src="{% static 'js/clients_modal.js' %}"></script>
++<script src="{% static 'js/pos_documentos.js' %}"></script>
+ <script src="{% static 'js/sale_form.js' %}"></script>
+ {% endif %}
+ {% endblock %}

@@ -1,0 +1,55 @@
+diff -ruN a/clients/migrations/0009_backfill_disponibilidad_clientes_nuevos.py b/clients/migrations/0009_backfill_disponibilidad_clientes_nuevos.py
+--- a/clients/migrations/0009_backfill_disponibilidad_clientes_nuevos.py	1970-01-01 00:00:00.000000000 +0000
++++ b/clients/migrations/0009_backfill_disponibilidad_clientes_nuevos.py	2026-10-03 05:09:55.744100698 +0000
+@@ -0,0 +1,32 @@
++"""
++Repara clientes creados después de la migración 0008 que no tienen su fila
++de disponibilidad (ClienteEmpresa) en su empresa propietaria. Sin esa fila
++no aparecían en Cotizaciones ("Escoja una opción válida..."). Aditiva e
++idempotente: no toca filas existentes (ni reactiva las desactivadas).
++"""
++
++from django.db import migrations
++
++
++def backfill(apps, schema_editor):
++    Client = apps.get_model('clients', 'Client')
++    ClienteEmpresa = apps.get_model('clients', 'ClienteEmpresa')
++    for cliente in Client.objects.filter(empresa__isnull=False).iterator():
++        ClienteEmpresa.objects.get_or_create(
++            cliente=cliente, empresa_id=cliente.empresa_id,
++            defaults={
++                'limite_credito': cliente.limite_credito,
++                'saldo_utilizado': cliente.saldo_utilizado,
++            },
++        )
++
++
++class Migration(migrations.Migration):
++
++    dependencies = [
++        ('clients', '0008_backfill_disponibilidad_empresa'),
++    ]
++
++    operations = [
++        migrations.RunPython(backfill, migrations.RunPython.noop),
++    ]
+diff -ruN a/clients/models.py b/clients/models.py
+--- a/clients/models.py	2026-10-03 05:09:55.741902051 +0000
++++ b/clients/models.py	2026-10-03 05:09:55.743051092 +0000
+@@ -106,6 +106,15 @@
+     def __str__(self):
+         return f'{self.nombre_completo} ({self.documento})'
+ 
++    def save(self, *args, **kwargs):
++        super().save(*args, **kwargs)
++        # Todo cliente nuevo queda disponible en su empresa propietaria.
++        # Sin esta fila, Cotizaciones (que filtra por ClienteEmpresa activa)
++        # lo rechaza con "Escoja una opción válida". get_or_create no
++        # reactiva una disponibilidad que alguien desactivó a propósito.
++        if self.empresa_id:
++            ClienteEmpresa.objects.get_or_create(cliente=self, empresa_id=self.empresa_id)
++
+     def para_empresa(self, empresa):
+         """Devuelve (creando si hace falta) el `ClienteEmpresa` de este
+         cliente para `empresa` (Fase N) — punto único de acceso al

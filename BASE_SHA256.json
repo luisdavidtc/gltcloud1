@@ -1,0 +1,6 @@
+{
+  "templates/sales/sale_form.html": "c3bf37a8f67b1fe672e3e6a42ff33c6cb1102b7fd6910ba1fa55f9f434aecbdf",
+  "static/js/pos_documentos.js": "be423ef20d0314c92ea7ddeb1e23793328964f7b082037269cffeade3e85955e",
+  "sales/pos_documentos.py": "71ad1303ae3514bd48d8bbe64e06ca69173fb44b79b648e996362f6fb187a447",
+  "cotizaciones/urls.py": "74a8f66e39e8e82cac06bbc8abfd88707d63e7694dbc4ea81def124e1d44342b"
+}

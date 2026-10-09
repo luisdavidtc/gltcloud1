@@ -1,0 +1,72 @@
+CORRECCIÓN DE HANDLERS POS / COTIZACIONES
+
+BASE: pos_cotizaciones_cliente_correo_toast.zip y cotizaciones_codigo_base.zip.
+No es el proyecto completo. Requiere Cotizaciones instalada, URLs incluidas en el proyecto,
+tablas migradas, módulo activo y permisos. Conserva servicio guardar(), CSRF y request.empresa.
+
+REEMPLAZAR:
+- templates/sales/sale_form.html
+- static/js/pos_documentos.js
+- sales/pos_documentos.py
+- cotizaciones/urls.py
+AGREGAR:
+- cotizaciones/pos_api.py
+El test_pos_api_aislado.py es opcional; no copiarlo como código de producción.
+No reemplaza sales/views.py, base.html, modelos, configuración SMTP ni menú lateral.
+Conservar cotizaciones/correo.py y static/js/cotizacion_toast.js del parche anterior.
+Si tienes rutas o cambios locales adicionales, integra CAMBIOS.patch; no sobrescribas.
+
+CAMBIOS:
+Inicialización DOMContentLoaded y eventos delegados con preventDefault.
+El helper toast ausente ya no rompe la acción; hay un aviso de respaldo.
+Validación no bloqueante de cliente, productos y validez antes del fetch.
+Guardar utiliza la ruta cotizaciones:pos_guardar, no depende de un adaptador en sales/views.py.
+Botones bloqueados solo durante la petición y restaurados en finally.
+Reutiliza documento guardado mientras carrito/cliente/fecha no cambien en esta página.
+Cambiar cliente/carrito tras guardado crea una nueva cotización: no se edita el documento anterior.
+Guardar intenta el correo automático solicitado anteriormente y siempre informa el número.
+Enviar por Correo verifica el email registrado mediante endpoint con filtro de empresa,
+y el servicio correo existente vuelve a validarlo en servidor y genera PDF adjunto.
+PDF/WhatsApp no envían un email automáticamente; guardan primero si hace falta.
+WhatsApp usa celular o teléfono registrado: móvil colombiano de 10 dígitos añade 57;
+los demás números deben tener código internacional. Abre mensaje con nombre, código y total.
+No adjunta PDF ni acredita envío de WhatsApp: descargar y adjuntar manualmente.
+PDF abre el visor inline con controles de impresión. No fuerza window.print() sobre un PDF.
+POS conserva el modal de pagos y no interpreta cotizaciones como ventas.
+Orden de Venta y Facturación Electrónica siguen bloqueadas sin backend de emisión.
+
+INSTALACIÓN:
+1. Respalda e integra los archivos sobre tu versión instalada.
+2. python manage.py check
+3. python manage.py collectstatic --noinput (si tu despliegue usa staticfiles)
+4. Reinicia Django y Ctrl+F5.
+No se añaden modelos ni migraciones nuevas.
+El JS usa un querystring de versión para evitar servir el controlador anterior en caché.
+
+PRUEBAS EN TU NAVEGADOR (no ejecutadas aquí):
+- F12 > Console: no debe aparecer un error al cargar la página.
+- Ejecutar: document.getElementById('ventaForm').dataset.documentosHandlersVersion
+  Debe devolver handlers-20261003-1.
+- F12 > Network: pos_documentos.js debe devolver 200.
+- Elegir Cotización y guardar sin cliente/productos: toast, sin POST ni diálogo bloqueante.
+- Cliente y productos válidos: POST a .../pos/guardar/, JSON con id/codigo/pdf_url.
+- Repetir Guardar sin cambios: reutiliza documento guardado, sin otra creación.
+- Correo válido: envío PDF; sin correo: advertencia, sin falso éxito.
+- SMTP caído: cotización conservada; reintentar con Enviar por Correo.
+- WhatsApp: toma teléfono registrado, pestaña con nombre y total; adjuntar PDF manualmente.
+- PDF: documento correcto e impresión desde visor.
+- Cliente/modal y flujo de cobro POS siguen funcionando.
+- Otra empresa o módulo desactivado: acceso bloqueado a cliente/guardado/PDF/correo.
+
+LÍMITES Y VALIDACIONES:
+AST Python y balance de bloques Django revisados.
+5 pruebas aisladas del endpoint con dobles y 7 pruebas del servicio correo anterior: OK.
+No hay Django, navegador, runtime JavaScript ni SMTP en este entorno.
+No se ejecutó manage.py check, renderizado real, onClick en navegador ni envío SMTP.
+No se demostró la causa exacta del fallo de tu instalación: esto endurece puntos de fallo
+identificados en el parche y elimina la dependencia del adaptador POST del POS.
+El backend existente no admite descuento monetario por línea: se rechaza con aviso,
+no se ignora ni se cambia el impuesto. Mantiene descuento global existente.
+No hay idempotencia persistente ni reintento automático. Si una respuesta se pierde o
+recargas tras guardar, revisa el historial antes de repetir para no duplicar documentos.
+SMTP confirmado significa aceptación del servidor, no recepción garantizada en bandeja.

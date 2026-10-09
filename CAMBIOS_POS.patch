@@ -1,0 +1,301 @@
+--- a/sales/views.py
++++ b/sales/views.py
+@@ -270,6 +270,23 @@
+     return render(request, 'sales/sale_list.html', contexto)
+ 
+ 
++def _render_pos(request, template_name, contexto):
++    """Render del formulario existente con historial acotado a la empresa activa."""
++    empresa = obtener_empresa_actual(request)
++    if empresa is None:
++        from django.core.exceptions import PermissionDenied
++        raise PermissionDenied("No hay una empresa activa.")
++    contexto = dict(contexto)
++    contexto.update({
++        'titulo': 'POS',
++        'facturas_recientes': list(
++            Sale.objects.filter(empresa=empresa).select_related('cliente')
++            .order_by('-fecha', '-pk')[:20]
++        ),
++    })
++    return render(request, template_name, contexto)
++
++
+ @login_required
+ @role_required(*ROLES_VENTAS)
+ def sale_create(request):
+@@ -284,7 +301,7 @@
+     empresa = obtener_empresa_actual(request)
+     sesion_caja = cashregister_services.caja_abierta_de(request.user, empresa)
+     if sesion_caja is None:
+-        return render(request, 'sales/sale_form.html', {
++        return _render_pos(request, 'sales/sale_form.html', {
+             'sin_caja_abierta': True,
+             'titulo': 'Nueva venta',
+             'seccion_activa': 'ventas',
+@@ -300,7 +317,7 @@
+ 
+         if not producto_ids:
+             messages.error(request, 'Debes agregar al menos un producto a la venta.')
+-            return render(request, 'sales/sale_form.html', {
++            return _render_pos(request, 'sales/sale_form.html', {
+                 'form': form, 'titulo': 'Nueva venta', 'seccion_activa': 'ventas',
+                 'categorias': Category.objects.filter(empresa=empresa).order_by('nombre'),
+                 'metodos_pago': PaymentMethod.activos_de(empresa),
+@@ -425,6 +442,8 @@
+                     cashregister_services.registrar_venta_en_caja(venta)
+ 
+                 messages.success(request, f'Venta {venta.numero} registrada correctamente.')
++                if request.POST.get('origen') == 'pos':
++                    return redirect('sales:sale_create')
+                 return redirect('sales:sale_detail', pk=venta.pk)
+             except ValueError as e:
+                 messages.error(request, str(e))
+@@ -454,7 +473,7 @@
+         'cliente_mostrador': cliente_mostrador,
+         'metodos_pago': PaymentMethod.activos_de(empresa),
+     }
+-    return render(request, 'sales/sale_form.html', contexto)
++    return _render_pos(request, 'sales/sale_form.html', contexto)
+ 
+ 
+ @login_required
+--- a/templates/sales/sale_form.html
++++ b/templates/sales/sale_form.html
+@@ -4,12 +4,16 @@
+ {% block page_title %}{{ titulo }}{% endblock %}
+ 
+ {% block content %}
++<div class="pos-intro"><div><span class="pos-eyebrow">PUNTO DE VENTA</span><h1>Crea una nueva venta</h1></div><span class="pos-intro-hint"><i class="bi bi-lightning-charge"></i> F2 Buscar · F9 Cobrar</span></div>
++<div class="pos-layout tw-grid tw-grid-cols-1 tw-gap-4 md:tw-grid-cols-pos">
++<section class="pos-workspace tw-min-w-0" aria-label="Creación de venta">
++
+ {% if sin_caja_abierta %}
+ <div class="card erp-animate-in">
+     <div class="card-body text-center py-5">
+         <i class="bi bi-cash-coin text-warning" style="font-size: 3rem;"></i>
+-        <h4 class="mt-3 mb-2">Debe abrir una caja antes de realizar ventas.</h4>
+-        <p class="text-muted mb-4">No tienes una sesión de caja abierta. Ábrela para poder registrar ventas.</p>
++        <h4 class="mt-3 mb-2">CAJA CERRADA</h4>
++        <p class="text-muted mb-4">Abre una caja correspondiente al día actual para poder registrar ventas. Puedes consultar el historial mientras tanto.</p>
+         <button type="button" class="btn btn-primary" data-caja-trigger data-recargar-al-exito="true"
+                 data-estado-url="{% url 'cashregister:cash_status' %}"
+                 data-abrir-url="{% url 'cashregister:cash_open' %}">
+@@ -31,12 +35,13 @@
+       data-cliente-mostrador-limite="{{ cliente_mostrador.limite_credito }}"
+       {% endif %}>
+     {% csrf_token %}
++    <input type="hidden" name="origen" value="pos">
+ 
+     <!-- ============ Barra superior estilo POS ============ -->
+     <div class="erp-pos-topbar erp-animate-in">
+         <div class="erp-pos-topbar-titulo">
+             <i class="bi bi-receipt"></i>
+-            <span>Remisión</span>
++            <span>Venta actual</span>
+         </div>
+         <div class="erp-pos-shortcuts">
+             <button type="button" class="erp-pos-shortcut" data-atajo="cliente">
+@@ -59,7 +64,7 @@
+ 
+     <div class="row g-3 mt-1">
+         <!-- =================== Columna izquierda: catálogo =================== -->
+-        <div class="col-lg-8">
++        <div class="col-12">
+             <div class="erp-card erp-animate-in p-3 p-md-4">
+                 <!-- Buscador principal -->
+                 <div class="position-relative mb-3">
+@@ -122,7 +127,7 @@
+         </div>
+ 
+         <!-- =================== Columna derecha: cliente + carrito =================== -->
+-        <div class="col-lg-4">
++        <div class="col-12">
+             <!-- Cliente -->
+             <div class="erp-card erp-animate-in p-3 mb-3">
+                 <div class="erp-pos-section-label"><i class="bi bi-person-fill"></i> Cliente</div>
+@@ -210,8 +215,8 @@
+                 <button type="button" class="btn erp-btn-confirmar w-100 mt-3" id="btnGuardar"
+                         data-bs-toggle="modal" data-bs-target="#modalConfirmarVenta">
+                     <i class="bi bi-cart-check-fill"></i>
+-                    <span class="d-block">Confirmar venta</span>
+-                    <small class="d-block fw-normal opacity-75">Facturar rápido con una sola tecla (F9)</small>
++                    <span class="d-block">Cobrar</span>
++                    <small class="d-block fw-normal opacity-75">Confirmar pago y registrar venta (F9)</small>
+                 </button>
+                 <a href="{% url 'sales:sale_list' %}" class="btn btn-outline-secondary w-100 mt-2">Cancelar</a>
+             </div>
+@@ -463,13 +468,54 @@
+     </tr>
+ </template>
+ {% endif %}
++</section>
++
++<aside class="erp-card pos-history tw-min-w-0" aria-labelledby="posHistoryTitle">
++    <header class="pos-history-heading">
++        <div><span class="pos-eyebrow">ACTIVIDAD RECIENTE</span>
++        <h2 id="posHistoryTitle">Facturas</h2></div>
++        <a href="{% url 'sales:sale_list' %}" target="_blank" rel="noopener" class="btn btn-outline-secondary btn-sm" title="Abrir historial completo">Ver todas <i class="bi bi-arrow-up-right"></i></a>
++    </header>
++    <div class="pos-history-list">
++    {% for factura in facturas_recientes %}
++        <article class="pos-history-item">
++            <div class="d-flex align-items-center justify-content-between gap-2">
++                <strong>{{ factura.numero_factura|default:factura.numero }}</strong>
++                <span class="badge {% if factura.estado == 'completada' %}bg-success{% elif factura.estado == 'pendiente' %}bg-warning text-dark{% else %}bg-danger{% endif %}">{{ factura.get_estado_display }}</span>
++            </div>
++            <p class="pos-history-client">{{ factura.cliente.nombre_completo|default:'Sin cliente' }}</p>
++            <div class="d-flex justify-content-between gap-2 align-items-center">
++                <small class="text-muted">{{ factura.fecha|date:'d/m/Y H:i' }}</small>
++                <strong class="pos-history-total">${{ factura.total|floatformat:0 }}</strong>
++            </div>
++            <div class="pos-history-actions">
++                <button type="button" class="btn btn-outline-primary btn-sm" data-pos-detail data-url="{% url 'sales:sale_detail' factura.pk %}"><i class="bi bi-eye"></i> Detalle</button>
++                <a class="btn btn-outline-secondary btn-sm" href="{% url 'sales:sale_print' factura.pk %}" target="_blank" rel="noopener"><i class="bi bi-printer"></i> Imprimir</a>
++            </div>
++        </article>
++    {% empty %}
++        <div class="pos-history-empty"><i class="bi bi-receipt"></i><p>Aún no hay ventas registradas en esta empresa.</p></div>
++    {% endfor %}
++    </div>
++</aside>
++
++</div>
++
++<div class="modal fade" id="posDetailModal" tabindex="-1" aria-labelledby="posDetailTitle" aria-hidden="true">
++ <div class="modal-dialog modal-xl modal-dialog-scrollable"><div class="modal-content">
++  <div class="modal-header"><h2 class="modal-title fs-5" id="posDetailTitle">Detalle de venta</h2><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Cerrar"></button></div>
++  <div class="modal-body" id="posDetailContent" aria-live="polite"></div>
++ </div></div>
++</div>
+ {% endblock %}
+ 
+ {% block extra_css %}
+ <link href="{% static 'css/pos.css' %}" rel="stylesheet">
++<link href="{% static 'css/pos_layout.css' %}" rel="stylesheet">
+ {% endblock %}
+ 
+ {% block extra_js %}
++<script src="{% static 'js/pos_layout.js' %}"></script>
+ {% if not sin_caja_abierta %}
+ <script src="{% static 'js/clients_modal.js' %}"></script>
+ <script src="{% static 'js/sale_form.js' %}"></script>
+--- a/templates/base.html
++++ b/templates/base.html
+@@ -69,27 +69,9 @@
+ 
+             {# ===================== FACTURACIÓN ===================== #}
+             {% if user.es_admin or user.role == 'vendedor' %}{% if 'ventas' in modulos_activos_codigos %}
+-            <a href="#submenuFacturacion" data-bs-toggle="collapse" role="button"
+-               aria-expanded="{% if seccion_activa == 'ventas' %}true{% else %}false{% endif %}"
+-               aria-controls="submenuFacturacion"
+-               class="nav-link {% if seccion_activa == 'ventas' %}erp-submenu-parent-active{% endif %}">
+-                <i class="bi bi-receipt"></i> <span class="erp-nav-text">Facturación</span>
+-                <i class="bi bi-chevron-down erp-submenu-caret"></i>
+-            </a>
+-            <div class="collapse erp-submenu {% if seccion_activa == 'ventas' %}show{% endif %}" id="submenuFacturacion">
+-                <nav class="nav flex-column">
+-                    <a href="{% url 'sales:sale_create' %}" class="nav-link">
+-                        <i class="bi bi-truck"></i> <span class="erp-nav-text">Remisiones</span>
+-                    </a>
+-                    <a href="{% url 'core:en_desarrollo' 'factura-electronica' %}" class="nav-link">
+-                        <i class="bi bi-file-earmark-medical"></i> <span class="erp-nav-text">Factura electrónica</span>
+-                        <span class="erp-badge-soon">Próximamente</span>
+-                    </a>
+-                    <a href="{% url 'sales:sale_list' %}" class="nav-link">
+-                        <i class="bi bi-clock-history"></i> <span class="erp-nav-text">Historial</span>
+-                    </a>
+-                </nav>
+-            </div>
++            <a href="{% url 'sales:sale_create' %}" class="nav-link {% if seccion_activa == 'ventas' %}active{% endif %}">
++                <i class="bi bi-shop"></i> <span class="erp-nav-text">POS</span>
++            </a>
+             {% endif %}{% endif %}
+ 
+             {# ===================== INVENTARIO ===================== #}
+@@ -233,9 +215,7 @@
+                class="nav-link d-flex justify-content-between align-items-center {% if seccion_activa == 'caja' %}erp-submenu-parent-active{% endif %}">
+                 <span class="erp-nav-label"><i class="bi bi-cash-coin"></i> <span class="erp-nav-text">Caja</span></span>
+                 <span class="d-flex align-items-center gap-1">
+-                    <span id="cajaEstadoBadge" class="badge {% if sesion_caja_activa %}bg-success{% else %}bg-secondary{% endif %} rounded-pill">
+-                        {% if sesion_caja_activa %}CAJA ABIERTA{% else %}CAJA CERRADA{% endif %}
+-                    </span>
++
+                     <i class="bi bi-chevron-down erp-submenu-caret"></i>
+                 </span>
+             </a>
+@@ -508,6 +488,17 @@
+                 <h5 class="mb-0 fw-semibold">{% block page_title %}{% endblock %}</h5>
+             </div>
+             <div class="d-flex align-items-center gap-2">
++
++            {% if user.es_admin or user.role == 'vendedor' %}{% if 'caja' in modulos_activos_codigos %}
++            <button type="button" class="btn btn-light d-flex align-items-center gap-2" data-caja-trigger
++                    {% if seccion_activa == 'ventas' %}data-recargar-al-exito="true"{% endif %}
++                    data-estado-url="{% url 'cashregister:cash_status' %}" data-abrir-url="{% url 'cashregister:cash_open' %}"
++                    title="{% if sesion_caja_activa %}Caja abierta{% else %}Caja cerrada{% endif %}"
++                    aria-label="{% if sesion_caja_activa %}Caja abierta: consultar sesión{% else %}Caja cerrada: abrir caja{% endif %}">
++                <span id="cajaEstadoBadge" data-caja-indicator aria-hidden="true" style="display:inline-block;width:10px;height:10px;flex-shrink:0;border-radius:50%;background:{% if sesion_caja_activa %}#198754{% else %}#dc3545{% endif %};"></span>
++                <span class="d-none d-sm-inline">Caja</span>
++            </button>
++            {% endif %}{% endif %}
+             <button type="button" class="btn btn-light erp-theme-toggle" id="erpThemeToggle"
+                     title="Cambiar a modo oscuro" aria-label="Cambiar a modo oscuro">
+                 <i class="bi bi-moon-stars"></i>
+--- a/static/js/cash_register.js
++++ b/static/js/cash_register.js
+@@ -41,6 +41,24 @@
+     let abrirUrlActivo = null;
+     let recargarAlExito = false;
+ 
++
++    function actualizarIndicadorCaja(abierta) {
++        if (!cajaEstadoBadge) return;
++        if (cajaEstadoBadge.hasAttribute('data-caja-indicator')) {
++            cajaEstadoBadge.style.backgroundColor = abierta ? '#198754' : '#dc3545';
++            const button = cajaEstadoBadge.closest('button');
++            if (button) {
++                button.title = abierta ? 'Caja abierta' : 'Caja cerrada';
++                button.setAttribute('aria-label', abierta ? 'Caja abierta: consultar sesión' : 'Caja cerrada: abrir caja');
++            }
++        } else {
++            // Compatibilidad con plantillas anteriores durante el despliegue.
++            cajaEstadoBadge.textContent = abierta ? 'CAJA ABIERTA' : 'CAJA CERRADA';
++            cajaEstadoBadge.classList.toggle('bg-success', abierta);
++            cajaEstadoBadge.classList.toggle('bg-secondary', !abierta);
++        }
++    }
++
+     function mostrarInfoCajaAbierta(sesion) {
+         detalleCajaYaAbierta.innerHTML = `
+             <li><strong>N.º sesión:</strong> ${sesion.numero}</li>
+@@ -61,14 +79,11 @@
+             fetch(estadoUrl)
+                 .then((resp) => resp.json())
+                 .then((data) => {
++                    actualizarIndicadorCaja(Boolean(data.abierta));
+                     if (data.abierta) {
+                         mostrarInfoCajaAbierta(data.sesion);
+                     } else {
+-                        if (cajaEstadoBadge) {
+-                            cajaEstadoBadge.textContent = 'CAJA CERRADA';
+-                            cajaEstadoBadge.classList.remove('bg-success');
+-                            cajaEstadoBadge.classList.add('bg-secondary');
+-                        }
++                        actualizarIndicadorCaja(false);
+                         formAbrirCaja.reset();
+                         alertaAbrirCaja.classList.add('d-none');
+                         inputSaldoInicial.classList.remove('is-invalid');
+@@ -108,11 +123,7 @@
+                         window.location.reload();
+                         return;
+                     }
+-                    if (cajaEstadoBadge) {
+-                        cajaEstadoBadge.textContent = 'CAJA ABIERTA';
+-                        cajaEstadoBadge.classList.remove('bg-secondary');
+-                        cajaEstadoBadge.classList.add('bg-success');
+-                    }
++                    actualizarIndicadorCaja(true);
+                     mostrarMensajeExito(data.mensaje);
+                 } else if (data.ya_abierta) {
+                     modalAbrirCaja.hide();

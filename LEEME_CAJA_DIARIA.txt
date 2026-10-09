@@ -1,0 +1,143 @@
+CAJA DIARIA Y ARQUEO — GLT CLOUD
+================================
+BASE REVISADA: erp.zip adjunto. Entrega de 24 archivos de código/plantillas/pruebas,
+no un proyecto reconstruido. No modifica plantillas ni vistas de reparaciones.
+
+IMPORTANTE: si tu proyecto tiene cambios posteriores en cualquiera de estos
+archivos (en especial templates/base.html, erp_config/settings.py o sales/models.py),
+NO lo reemplaces ciegamente. Integra exclusivamente los bloques de cambios de
+caja usando CAMBIOS_CAJA.patch. Incluimos hashes de los originales en MANIFEST.json
+para poder comprobar la versión de partida. Haz copia de código y base de datos.
+
+REVISIÓN PREVIA
+- CashSession: cashregister/models.py; ya tenía empresa, usuario, saldo inicial,
+  fecha_apertura, estado, fecha_cierre, saldo_final y AuditedHistoricalRecords.
+- Apertura/cierre/movimientos: cashregister/views.py y forms.py.
+- Caja activa: services.caja_abierta_de + consultas duplicadas de views y context.
+- Ventas: sales/views.py sale_create consultaba caja antes y dentro de atomic;
+  repairs/models.py facturar ya reutilizaba ese mismo servicio.
+- Compras de contado: purchases/views.py y purchases/services.py confirmar_compra.
+- Pagos existentes: SalePayment; no se inventó un módulo de cobros de cartera.
+Reutilizamos esas rutas, clases, pagos mixtos, inventario, reportes y auditoría.
+
+MODELOS Y MIGRACIÓN
+CashSession y su espejo HistoricalCashSession incorporan:
+- business_date: fecha de operación indexada.
+- apertura_denominaciones/cierre_denominaciones: JSON {denominación: cantidad}.
+- efectivo_esperado/efectivo_contado/diferencia: Decimal nullable.
+- cierre_automatico: booleano.
+- motivo_cierre: texto.
+- cierre_automatico_detectado_en: fecha/hora real de detección.
+No se crea un modelo extra de denominaciones. CashMovement no cambia de esquema.
+Sale/SalePayment no cambian de esquema: incorporan guardas de escritura.
+Migración: cashregister/migrations/0010_daily_cash_and_denominations.py.
+Rellena business_date desde fecha_apertura, en zona horaria del tenant, también
+para snapshots históricos. No borra sesiones ni movimientos, ni inventa arqueos.
+Los antiguos arqueos quedan vacíos; conteos/diferencias desconocidos quedan NULL.
+La unicidad de caja abierta pasa de usuario a usuario+empresa: conserva la caja
+por responsable y evita que una empresa bloquee la apertura legítima en otra.
+No impone una sola apertura por día: permite reapertura tras cierre manual, como
+antes; ninguna sesión puede continuar operando en una fecha distinta.
+
+CIERRE DIARIO
+La fecha actual usa Empresa.zona_horaria (por defecto America/Bogota), no la
+fecha UTC ni el reloj del navegador. Las sesiones previas se cierran lógicamente
+al entrar al ERP, consultar caja activa o intentar operar. No requiere cron.
+A medianoche quedan inoperables por validación de business_date; el estado
+persistido se actualiza en la primera solicitud/consulta, no por un temporizador.
+fecha_cierre = 00:00 del día siguiente a business_date (límite efectivo).
+cierre_automatico_detectado_en = momento real de detección, incluso tras apagado.
+Motivo = "Cierre automático por cambio de día".
+Saldo esperado conserva el cálculo actual de movimientos y saldo inicial.
+NO hay efectivo contado ni diferencia ficticios en un cierre automático.
+Los cierres manuales sí guardan conteo físico, diferencia y usuario en auditoría.
+La expiración es idempotente y no borra/modifica movimientos.
+
+VALIDACIONES
+- Autenticación, usuario activo, acceso al tenant y módulo caja activo.
+- Empresa de la sesión, propietario (admin puede cerrar), rol por empresa.
+- Sesión abierta + business_date igual al día local actual.
+- select_for_update dentro de atomic para escribir/cerrar sobre la misma fila.
+- Guardas en Sale.save, SalePayment.save, asignación de factura y CashMovement.save.
+- Compra de contado valida antes de tocar inventario y vuelve a validar al mover caja.
+- JSON y cantidades enteras >= 0, rechazo de negativos, decimales, campos ausentes,
+  denominaciones extra y total fuera de la capacidad del campo decimal.
+- Total enviado por cliente se ignora: se recalcula en backend.
+- No cambiar registros mediante QuerySet.update/bulk_create/raw SQL para operaciones
+  de negocio: esos métodos eluden save y auditoría, como en cualquier modelo Django.
+  Los nuevos endpoints deben reutilizar el servicio/validación transaccional.
+- Una transacción fallida puede revertir la persistencia de una expiración detectada
+  dentro de ella, pero nunca permite usar la sesión vencida. Middleware/consulta
+  siguiente persiste el cierre fuera de la operación fallida.
+
+INTERFAZ
+Se reutilizan tarjetas Bootstrap y estilos actuales. Modal ampliado con Billetes/
+Monedas y total calculado; cierre con esperado/contado/diferencia. Historial,
+PDF y ticket conservan los reportes previos y agregan arqueo. El estado visible
+se actualiza al cargar/consultar caja; una pestaña dejada abierta puede mostrar
+su estado anterior hasta consultar/recargar, pero el backend siempre revalida.
+
+INSTALACIÓN (POWERHELL, UN COMANDO A LA VEZ)
+1. Respalda y aplica los archivos o integra el patch en versiones más recientes.
+2. Activa el entorno virtual que utilizas normalmente.
+3. Ejecuta:
+   python manage.py check
+   python manage.py migrate
+   python manage.py makemigrations --check --dry-run
+   python manage.py test cashregister.test_daily_cash
+   python manage.py test
+4. Si usas staticfiles en despliegue:
+   python manage.py collectstatic --noinput
+5. Reinicia servidor y recarga sin caché para cargar el nuevo JS.
+No necesitas generar migraciones adicionales; si --check detecta diferencias,
+detén la instalación y envía el resultado antes de continuar en producción.
+
+PRUEBAS Y LIMITACIONES REALES
+- 7 pruebas puras ejecutadas y correctas: cálculo, cero, valores inválidos,
+  esquema incompleto/extra, límite decimal y normalización.
+- 27 pruebas Django escritas, NO ejecutadas: el intento falló al importar Django.
+- Sintaxis Python AST y anidamiento de bloques Django comprobados.
+- NO se ejecutó migrate, renderizado en navegador, impresión ni concurrencia real.
+- Pruebas de concurrencia deben comprobarse con la base real (PostgreSQL);
+  SQLite no implementa bloqueos de fila select_for_update equivalentes.
+- No declarar esta entrega validada en producción hasta pasar pruebas/migraciones.
+
+PRUEBA MANUAL EN UNA BASE DE PRUEBAS
+A/B: abre caja del 02/10, registra cantidades y una venta, también pago mixto.
+C/D: simula 03/10 con mocks en la suite; no cambies el reloj de producción.
+     Debe mostrar CAJA CERRADA, bloquear ventas/pagos/POST y exigir apertura.
+E: abre caja nueva y comprueba que tiene nueva fecha y otro número.
+F: sin caja, intenta venta/facturación de reparación: mensaje de nueva apertura.
+G: cierra por cantidades; verifica faltante/sobrante/cero real y auditoría.
+H: deja sesión del día anterior, reinicia servidor: primera solicitud la vence;
+   verifica corte 00:00 y hora real de detección; sin conteo ficticio.
+I: intenta acceder mediante URL/POST al pk de caja de otra empresa: 404/bloqueo.
+Extras: sesión cerrada no recibe movimientos; doble clic en apertura/cierre;
+formulario enviado antes de medianoche pero guardado después; module OFF;
+cantidad -1, 1.5, 1.0, total POST manipulado; historial antiguo consultable.
+
+ARCHIVOS ENTREGADOS
+- cashregister/denominations.py
+- cashregister/daily.py
+- cashregister/middleware.py
+- erp_config/settings.py
+- cashregister/models.py
+- cashregister/forms.py
+- cashregister/services.py
+- cashregister/context_processors.py
+- cashregister/views.py
+- sales/models.py
+- purchases/services.py
+- templates/cashregister/_denominations.html
+- cashregister/templatetags/__init__.py
+- cashregister/templatetags/cash_denominations.py
+- static/js/cash_denominations.js
+- templates/base.html
+- static/js/cash_register.js
+- templates/cashregister/session_confirm_close.html
+- templates/cashregister/session_detail.html
+- templates/cashregister/session_close_ticket.html
+- cashregister/pdf.py
+- cashregister/migrations/0010_daily_cash_and_denominations.py
+- cashregister/test_daily_cash.py
+- cashregister/test_denominations_pure.py

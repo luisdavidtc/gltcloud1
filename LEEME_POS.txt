@@ -1,0 +1,18 @@
+POS GLT Cloud — interfaz, sin migraciones.
+BASE: erp.zip adjunto + base.html y cash_register.js del parche caja_diaria_arqueo_parche.zip. Requiere el parche de caja diaria ya aplicado y migrado, pues base.html utiliza su parcial de denominaciones.
+REEMPLAZAR: sales/views.py, templates/base.html, templates/sales/sale_form.html, static/js/cash_register.js.
+AGREGAR: static/css/pos_layout.css, static/js/pos_layout.js.
+Los archivos pos_tailwind/ son fuentes opcionales para Tailwind 3. El CSS entregado es CSS local con utilidades compatibles prefijadas, no una compilación verificada de Tailwind. No instala dependencias, no usa CDN Tailwind ni cambia Bootstrap.
+Respalde código y base de datos antes de copiar. Si tiene modificaciones posteriores, integre CAMBIOS_POS.patch; no sobrescriba archivos compartidos sin comparar.
+Ejecute uno por uno, deteniéndose al primer error:
+python manage.py check
+python manage.py test sales
+python manage.py test cashregister.test_daily_cash
+python manage.py test
+En producción publique estáticos mediante el procedimiento habitual (collectstatic si corresponde). Reinicie Django y recargue sin caché. Abra /ventas/nueva/ o pulse POS.
+El historial muestra 20 ventas recientes de la empresa activa. Detalle en modal, impresión e historial completo en otra pestaña. Tras cobrar desde POS vuelve a una venta nueva. No hay actualización en tiempo real del historial entre pestañas.
+Se conservan formularios, IDs, métodos de pago, modales y scripts originales. No se modifican servicios, modelos, migraciones, inventario, cálculos fiscales ni permisos. IVA incluido según producto; no se suma 19% nuevamente.
+El círculo de caja se mueve al encabezado global y reutiliza apertura y consulta existentes. La caja cerrada sigue bloqueando ventas en backend. El indicador no sustituye esa seguridad ni garantiza actualización automática al llegar medianoche sin otra petición: los servicios diarios siguen siendo la autoridad.
+Pruebas manuales pendientes: buscar por código/nombre, agregar y retirar productos, cliente nuevo/mostrador, descuentos, efectivo/tarjeta/pagos mixtos, IVA gravado/exento/excluido, cobro exitoso, errores de formulario, caja cerrada y vencida, apertura por denominaciones, permisos y aislamiento de empresas, imprimir, ver detalle sin perder carrito, móvil y tema oscuro.
+LIMITACIONES heredadas: no se reconstruye el carrito tras errores POST; se conserva el comportamiento anterior. La auditoría y seguridad funcional completa requieren Django y base de pruebas.
+Validado aquí: sintaxis Python, balance de bloques Django y preservación de IDs/nombres/atajos. No se ejecutó Django ni navegador; Django no está instalado. No afirmar que pasó pruebas de integración.

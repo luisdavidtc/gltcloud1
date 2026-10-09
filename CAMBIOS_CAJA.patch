@@ -1,0 +1,1340 @@
+--- a/cashregister/denominations.py
++++ b/cashregister/denominations.py
+@@ -0,0 +1,25 @@
++"""Arqueo COP: cálculo puro compartido; ningún total recibido se considera confiable."""
++import re
++from decimal import Decimal
++
++BILLETES = (200000, 100000, 50000, 20000, 10000, 5000, 2000)
++MONEDAS = (1000, 500, 200, 100, 50)
++DENOMINACIONES = BILLETES + MONEDAS
++MAX_TOTAL = Decimal('9999999999.99')
++
++
++def calcular_arqueo(cantidades):
++    if not isinstance(cantidades, dict) or set(cantidades) != {str(d) for d in DENOMINACIONES}:
++        raise ValueError('Registra la cantidad de todas las denominaciones; utiliza 0 donde no haya efectivo.')
++    normalizadas = {}
++    total = Decimal('0')
++    for denominacion in DENOMINACIONES:
++        valor = cantidades[str(denominacion)]
++        if isinstance(valor, bool) or not re.fullmatch(r'[0-9]{1,9}', str(valor)):
++            raise ValueError(f'La cantidad de ${denominacion:,} debe ser un entero mayor o igual a cero.')
++        cantidad = int(valor)
++        normalizadas[str(denominacion)] = cantidad
++        total += Decimal(denominacion) * cantidad
++    if total > MAX_TOTAL:
++        raise ValueError('El efectivo excede el máximo permitido para una sesión de caja.')
++    return normalizadas, total
+--- a/cashregister/daily.py
++++ b/cashregister/daily.py
+@@ -0,0 +1,96 @@
++"""Única política de vigencia diaria, zona horaria y autorización de caja.
++
++Los bloqueos deben mantenerse dentro de la transacción que escribe. El
++middleware detecta vencimientos antes de la transacción de la operación;
++los servicios y modelos vuelven a validar para evitar TOCTOU.
++"""
++from datetime import datetime, time, timedelta
++from zoneinfo import ZoneInfo
++
++from django.db import transaction
++from django.utils import timezone
++
++MENSAJE_CAJA_CERRADA = 'CAJA CERRADA. Debes realizar una nueva apertura para el día de operación actual.'
++MOTIVO_AUTOMATICO = 'Cierre automático por cambio de día'
++
++
++def zona_empresa(empresa):
++    return ZoneInfo(empresa.zona_horaria or 'America/Bogota')
++
++
++def fecha_operacion(empresa, instante=None):
++    return timezone.localtime(instante or timezone.now(), zona_empresa(empresa)).date()
++
++
++def fin_jornada(sesion):
++    return timezone.make_aware(
++        datetime.combine(sesion.business_date + timedelta(days=1), time.min),
++        zona_empresa(sesion.empresa),
++    )
++
++
++def autorizar_usuario(usuario, empresa, roles=None):
++    if empresa is None or not getattr(usuario, 'is_authenticated', False) or not usuario.is_active:
++        raise ValueError('Se requiere un usuario autenticado y una empresa activa.')
++    if not usuario.is_superuser and not usuario.empresas_accesibles.filter(pk=empresa.pk).exists():
++        raise ValueError('No tienes acceso a esta empresa.')
++    if roles and not usuario.is_superuser and usuario.rol_en(empresa) not in roles:
++        raise ValueError('No tienes permisos para realizar esta operación de caja.')
++    from platform_admin.models import EmpresaModulo
++    if not EmpresaModulo.objects.filter(empresa=empresa, modulo__codigo='caja', activo=True).exists():
++        raise ValueError('El módulo Caja no está activo para esta empresa.')
++
++
++def expirar_sesiones(empresa, usuario=None):
++    """Cierre lógico idempotente. No modifica movimientos ni inventa conteos.
++
++    fecha_cierre: límite efectivo de operación (00:00 del siguiente día).
++    cierre_automatico_detectado_en: instante real de detección, incluso
++    si el servidor estuvo apagado. Cada save genera historial auditado.
++    """
++    from .models import CashSession
++    from .services import calcular_resumen_movimientos
++    if empresa is None:
++        return
++    hoy = fecha_operacion(empresa)
++    with transaction.atomic():
++        qs = CashSession.objects.select_for_update().filter(
++            empresa=empresa, estado=CashSession.Estado.ABIERTA, business_date__lt=hoy,
++        )
++        if usuario is not None:
++            qs = qs.filter(usuario=usuario)
++        for sesion in qs:
++            sesion.fecha_cierre = fin_jornada(sesion)
++            sesion.cierre_automatico_detectado_en = timezone.now()
++            sesion.saldo_final = calcular_resumen_movimientos(sesion)[0]['saldo_actual']
++            sesion.efectivo_esperado = sesion.saldo_final
++            sesion.cierre_automatico = True
++            sesion.motivo_cierre = MOTIVO_AUTOMATICO
++            sesion.estado = CashSession.Estado.CERRADA
++            sesion._history_user = None  # acción del sistema, no conteo del usuario que entra
++            sesion._change_reason = MOTIVO_AUTOMATICO
++            sesion.save(update_fields=[
++                'fecha_cierre', 'cierre_automatico_detectado_en', 'saldo_final',
++                'efectivo_esperado', 'cierre_automatico', 'motivo_cierre', 'estado',
++            ])
++
++
++def validar_sesion_actual(sesion, usuario, empresa, *, roles=None, permitir_admin=False):
++    """Devuelve la fila BLOQUEADA; requiere transaction.atomic en el llamador."""
++    from .models import CashSession
++    autorizar_usuario(usuario, empresa, roles)
++    if sesion is None or sesion.empresa_id != empresa.pk:
++        raise ValueError(MENSAJE_CAJA_CERRADA)
++    if not transaction.get_connection().in_atomic_block:
++        raise RuntimeError('La validación de escritura de caja requiere transaction.atomic().')
++    actual = CashSession.objects.select_for_update().get(pk=sesion.pk, empresa=empresa)
++    propio = actual.usuario_id == usuario.pk
++    administrador = permitir_admin and (usuario.is_superuser or usuario.rol_en(empresa) == 'admin')
++    if not propio and not administrador:
++        raise ValueError('Solo puedes operar en tu propia caja.')
++    if actual.estado != CashSession.Estado.ABIERTA or actual.business_date != fecha_operacion(empresa):
++        # Si la transacción del llamador revierte, la sesión sigue inactiva
++        # por fecha; la próxima consulta/middleware persiste su vencimiento.
++        expirar_sesiones(empresa, actual.usuario)
++        raise ValueError(MENSAJE_CAJA_CERRADA)
++    return actual
+--- a/cashregister/middleware.py
++++ b/cashregister/middleware.py
+@@ -0,0 +1,13 @@
++"""Detecta cambios de jornada antes de procesar cualquier vista del tenant."""
++from .daily import expirar_sesiones
++
++
++class DailyCashMiddleware:
++    def __init__(self, get_response):
++        self.get_response = get_response
++
++    def __call__(self, request):
++        empresa = getattr(request, 'empresa', None)
++        if empresa is not None and getattr(request.user, 'is_authenticated', False):
++            expirar_sesiones(empresa)
++        return self.get_response(request)
+--- a/erp_config/settings.py
++++ b/erp_config/settings.py
+@@ -86,6 +86,7 @@
+     # Expone el request actual a django-simple-history (para registrar
+     # quién hizo el cambio y, vía core.history, desde qué IP).
+     'simple_history.middleware.HistoryRequestMiddleware',
++    'cashregister.middleware.DailyCashMiddleware',
+     'django.contrib.messages.middleware.MessageMiddleware',
+     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+ ]
+--- a/cashregister/models.py
++++ b/cashregister/models.py
+@@ -15,7 +15,8 @@
+ 
+ from django.conf import settings
+ from django.core.validators import MinValueValidator
+-from django.db import models
++from django.db import models, transaction
++from django.db.models import Q
+ from django.utils import timezone
+ 
+ from core.history import AuditedHistoricalRecords
+@@ -61,7 +62,17 @@
+         help_text='Calculado y asignado al cerrar la caja (ver cashregister.services.cerrar_caja).',
+     )
+ 
+-    # Historial de auditoría (usuario, fecha/hora, IP) — ver core/history.py
++    business_date = models.DateField('Fecha de operación', default=timezone.localdate, db_index=True)
++    apertura_denominaciones = models.JSONField('Arqueo de apertura', default=dict, blank=True)
++    cierre_denominaciones = models.JSONField('Arqueo de cierre', default=dict, blank=True)
++    efectivo_esperado = models.DecimalField('Efectivo esperado', max_digits=12, decimal_places=2, null=True, blank=True)
++    efectivo_contado = models.DecimalField('Efectivo contado', max_digits=12, decimal_places=2, null=True, blank=True)
++    diferencia = models.DecimalField('Diferencia', max_digits=12, decimal_places=2, null=True, blank=True)
++    cierre_automatico = models.BooleanField('Cierre automático', default=False)
++    motivo_cierre = models.CharField('Motivo del cierre', max_length=150, blank=True)
++    cierre_automatico_detectado_en = models.DateTimeField('Detección del cierre automático', null=True, blank=True)
++
++    # El arqueo, diferencia y motivo se incluyen en cada snapshot auditado.
+     historial = AuditedHistoricalRecords()
+ 
+     class Meta:
+@@ -69,13 +80,13 @@
+         verbose_name_plural = 'Sesiones de caja'
+         ordering = ['-fecha_apertura']
+         constraints = [
+-            # Garantiza "un usuario solo puede tener una caja abierta a
+-            # la vez" a nivel de base de datos (no solo con un `if` en
++            # Garantiza "un usuario solo puede tener una caja abierta por
++            # empresa a la vez" a nivel de base de datos (no solo con un `if` en
+             # la vista), evitando condiciones de carrera.
+             models.UniqueConstraint(
+-                fields=['usuario'],
++                fields=['usuario', 'empresa'],
+                 condition=models.Q(estado='abierta'),
+-                name='unica_caja_abierta_por_usuario',
++                name='unica_caja_abierta_por_usuario_empresa',
+             ),
+         ]
+ 
+@@ -83,6 +94,15 @@
+         return f'{self.numero} - {self.usuario} ({self.get_estado_display()})'
+ 
+     def save(self, *args, **kwargs):
++        if self._state.adding:
++            from .daily import fecha_operacion, autorizar_usuario, expirar_sesiones
++            from .denominations import calcular_arqueo
++            autorizar_usuario(self.usuario, self.empresa, ('admin', 'vendedor', 'cajero'))
++            expirar_sesiones(self.empresa, self.usuario)
++            cantidades, total = calcular_arqueo(self.apertura_denominaciones)
++            self.apertura_denominaciones = cantidades
++            self.saldo_inicial = total
++            self.business_date = fecha_operacion(self.empresa)
+         super().save(*args, **kwargs)
+         # Igual que RepairOrder.numero_orden: el número necesita el pk,
+         # así que se asigna en un segundo save() solo la primera vez.
+@@ -108,10 +128,12 @@
+         return (
+             Sale.objects.filter(
+                 vendedor=self.usuario,
++                empresa=self.empresa,
+                 fecha__gte=self.fecha_apertura,
+-                fecha__lte=fin,
++                fecha__lt=fin,
+                 estado=Sale.Estado.COMPLETADA,
+             )
++            .filter(Q(sesion_caja=self) | Q(sesion_caja__isnull=True))
+             .select_related('cliente')
+             .prefetch_related('pagos__metodo_pago')
+             .order_by('fecha')
+@@ -206,7 +228,7 @@
+         help_text='Compra que originó este movimiento (solo cuando origen="compra"). Nulo en movimientos manuales o de venta.',
+     )
+ 
+-    # Historial de auditoría (usuario, fecha/hora, IP) — ver core/history.py
++    # Historial de auditoría (usuario, fecha/hora, IP).
+     historial = AuditedHistoricalRecords()
+ 
+     class Meta:
+@@ -216,6 +238,29 @@
+ 
+     def __str__(self):
+         return f'{self.get_tipo_display()} - {self.concepto} ({self.valor})'
++
++    def save(self, *args, **kwargs):
++        from .daily import validar_sesion_actual
++        with transaction.atomic():
++            roles = {
++                self.Origen.MANUAL: ('admin', 'vendedor', 'cajero'),
++                self.Origen.VENTA: ('admin', 'vendedor', 'cajero', 'tecnico'),
++                self.Origen.COMPRA: ('admin', 'vendedor', 'compras'),
++            }.get(self.origen, ())
++            if not roles:
++                raise ValueError('Origen de movimiento no permitido.')
++            sesion = validar_sesion_actual(self.sesion, self.usuario, self.sesion.empresa, roles=roles)
++            if self.venta_relacionada_id and self.venta_relacionada.empresa_id != sesion.empresa_id:
++                raise ValueError('La venta pertenece a otra empresa.')
++            if self.compra_relacionada_id and self.compra_relacionada.empresa_id != sesion.empresa_id:
++                raise ValueError('La compra pertenece a otra empresa.')
++            if self.venta_relacionada_id and self.venta_relacionada.sesion_caja_id != sesion.pk:
++                raise ValueError('La venta no corresponde a esta sesión de caja.')
++            if self.compra_relacionada_id and self.compra_relacionada.sesion_caja_id != sesion.pk:
++                raise ValueError('La compra no corresponde a esta sesión de caja.')
++            self.sesion = sesion
++            self.full_clean()
++            return super().save(*args, **kwargs)
+ 
+     @property
+     def afecta_saldo(self):
+--- a/cashregister/forms.py
++++ b/cashregister/forms.py
+@@ -7,23 +7,51 @@
+ from .models import CashMovement, CashSession
+ 
+ 
+-class CashSessionOpenForm(forms.ModelForm):
+-    """Formulario de apertura de caja: solo pide saldo inicial (obligatorio)
+-    y observaciones (opcional). El usuario y la fecha se asignan solos."""
++from .denominations import DENOMINACIONES, calcular_arqueo
+ 
+-    class Meta:
+-        model = CashSession
+-        fields = ('saldo_inicial', 'observaciones')
+-        widgets = {
+-            'saldo_inicial': forms.NumberInput(attrs={
+-                'class': 'form-control', 'step': '0.01', 'min': '0',
+-                'id': 'id_saldo_inicial', 'placeholder': '0.00',
+-            }),
+-            'observaciones': forms.Textarea(attrs={
+-                'class': 'form-control', 'rows': 2, 'id': 'id_observaciones_caja',
+-                'placeholder': 'Opcional',
+-            }),
+-        }
++
++class CantidadEnteraField(forms.IntegerField):
++    def to_python(self, value):
++        import re
++        if value not in self.empty_values and not re.fullmatch(r'[0-9]{1,9}', str(value)):
++            raise forms.ValidationError('Escribe un número entero mayor o igual a cero, sin decimales.')
++        return super().to_python(value)
++
++
++class ArqueoForm(forms.Form):
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        for d in DENOMINACIONES:
++            self.fields[f'cantidad_{d}'] = CantidadEnteraField(
++                min_value=0, initial=0, label=f'${d:,}',
++                widget=forms.NumberInput(attrs={'min': '0', 'step': '1', 'class': 'form-control'}),
++            )
++
++    def clean(self):
++        data = super().clean()
++        if not self.errors:
++            try:
++                self.cantidades, self.total = calcular_arqueo({str(d): data[f'cantidad_{d}'] for d in DENOMINACIONES})
++            except ValueError as error:
++                raise forms.ValidationError(str(error))
++        return data
++
++
++class CashSessionOpenForm(ArqueoForm):
++    observaciones = forms.CharField(required=False, widget=forms.Textarea)
++
++    def save(self, commit=True):
++        sesion = CashSession(
++            saldo_inicial=self.total, apertura_denominaciones=self.cantidades,
++            observaciones=self.cleaned_data.get('observaciones', ''),
++        )
++        if commit:
++            sesion.save()
++        return sesion
++
++
++class CashSessionCloseForm(ArqueoForm):
++    pass
+ 
+ 
+ class CashMovementForm(forms.ModelForm):
+--- a/cashregister/services.py
++++ b/cashregister/services.py
+@@ -24,6 +24,7 @@
+ from django.utils import timezone
+ 
+ from .models import CashMovement, CashSession
++from .daily import fecha_operacion, expirar_sesiones, validar_sesion_actual, autorizar_usuario
+ 
+ 
+ # ===================== Consulta =====================
+@@ -31,9 +32,20 @@
+ def caja_abierta_de(usuario, empresa):
+     """Sesión de caja abierta del usuario dado, dentro de la empresa
+     dada, o None."""
+-    return CashSession.objects.filter(
++    if empresa is None or not getattr(usuario, 'is_authenticated', False):
++        return None
++    try:
++        autorizar_usuario(usuario, empresa)
++    except ValueError:
++        return None
++    expirar_sesiones(empresa, usuario)
++    qs = CashSession.objects.filter(
+         usuario=usuario, empresa=empresa, estado=CashSession.Estado.ABIERTA,
+-    ).first()
++        business_date=fecha_operacion(empresa),
++    )
++    if transaction.get_connection().in_atomic_block:
++        qs = qs.select_for_update()
++    return qs.first()
+ 
+ 
+ # ===================== Resumen de movimientos =====================
+@@ -105,6 +117,8 @@
+     if not venta.vendedor_id:
+         return None
+ 
++    with transaction.atomic():
++        validar_sesion_actual(venta.sesion_caja, venta.vendedor, venta.empresa)
+     monto_efectivo = venta.monto_pagado_con('efectivo')
+     if monto_efectivo <= 0:
+         return None
+@@ -155,7 +169,10 @@
+     ).first()
+     if movimiento is None:
+         return None
+-    if movimiento.sesion.estado != CashSession.Estado.ABIERTA:
++    expirar_sesiones(movimiento.sesion.empresa)
++    movimiento.sesion.refresh_from_db()
++    if (movimiento.sesion.estado != CashSession.Estado.ABIERTA
++            or movimiento.sesion.business_date != fecha_operacion(movimiento.sesion.empresa)):
+         return None
+ 
+     ya_reversada = CashMovement.objects.filter(
+@@ -209,9 +226,8 @@
+     if compra.estado != Compra.Estado.CONFIRMADA:
+         return None
+ 
+-    sesion = compra.sesion_caja
+-    if sesion is None:
+-        return None
++    with transaction.atomic():
++        sesion = validar_sesion_actual(compra.sesion_caja, compra.creado_por, compra.empresa)
+ 
+     ya_registrado = CashMovement.objects.filter(
+         compra_relacionada=compra, origen=CashMovement.Origen.COMPRA,
+@@ -318,11 +334,14 @@
+         'movimientos': movimientos,
+         'total_ingresos_caja': resumen['total_ingresos'],
+         'total_egresos_caja': resumen['total_egresos'],
+-        'saldo_final': resumen['saldo_actual'],
++        'saldo_final': sesion.saldo_final if sesion.estado == CashSession.Estado.CERRADA else resumen['saldo_actual'],
++        'efectivo_esperado': sesion.efectivo_esperado,
++        'efectivo_contado': sesion.efectivo_contado,
++        'diferencia': sesion.diferencia,
+     }
+ 
+ 
+-def cerrar_caja(sesion):
++def cerrar_caja(sesion, cantidades, *, usuario):
+     """Cierra una sesión de caja: valida que siga abierta, calcula el
+     saldo final a partir de sus movimientos, guarda `fecha_cierre` y
+     `saldo_final`, cambia el estado a 'cerrada' y devuelve los datos
+@@ -337,10 +356,13 @@
+ 
+     Lanza ValueError si la sesión ya estaba cerrada.
+     """
++    from .denominations import calcular_arqueo
++    cantidades, contado = calcular_arqueo(cantidades)
++    expirar_sesiones(sesion.empresa)
+     with transaction.atomic():
+-        sesion_bloqueada = CashSession.objects.select_for_update().get(pk=sesion.pk)
+-        if sesion_bloqueada.estado == CashSession.Estado.CERRADA:
+-            raise ValueError(f'La caja {sesion_bloqueada.numero} ya está cerrada.')
++        sesion_bloqueada = validar_sesion_actual(
++            sesion, usuario, sesion.empresa, roles=('admin', 'vendedor', 'cajero'), permitir_admin=True,
++        )
+ 
+         # Se fija fecha_cierre antes de generar el reporte para que el
+         # rango de `ventas_del_periodo` (que usa fecha_cierre como
+@@ -351,8 +373,17 @@
+         datos = generar_datos_cierre(sesion_bloqueada)
+         sesion_bloqueada.saldo_final = datos['saldo_final']
+         sesion_bloqueada.estado = CashSession.Estado.CERRADA
+-        sesion_bloqueada.save(update_fields=['fecha_cierre', 'saldo_final', 'estado'])
++        sesion_bloqueada.cierre_denominaciones = cantidades
++        sesion_bloqueada.efectivo_esperado = datos['saldo_final']
++        sesion_bloqueada.efectivo_contado = contado
++        sesion_bloqueada.diferencia = contado - datos['saldo_final']
++        sesion_bloqueada.motivo_cierre = 'Cierre manual con arqueo físico'
++        sesion_bloqueada._history_user = usuario
++        sesion_bloqueada._change_reason = 'Cierre manual con arqueo físico'
++        sesion_bloqueada.save(update_fields=[
++            'fecha_cierre', 'saldo_final', 'estado', 'cierre_denominaciones',
++            'efectivo_esperado', 'efectivo_contado', 'diferencia', 'motivo_cierre',
++        ])
+ 
+     sesion.refresh_from_db()
+-    datos['sesion'] = sesion
+-    return datos
++    return generar_datos_cierre(sesion)
+--- a/cashregister/context_processors.py
++++ b/cashregister/context_processors.py
+@@ -19,11 +19,9 @@
+ def cash_context(request):
+     if not request.user.is_authenticated:
+         return {}
+-    from .models import CashSession
++    from .services import caja_abierta_de
+     from .tenant_utils import obtener_empresa_actual
+ 
+     empresa = obtener_empresa_actual(request)
+-    sesion = CashSession.objects.filter(
+-        usuario=request.user, empresa=empresa, estado=CashSession.Estado.ABIERTA,
+-    ).first()
++    sesion = caja_abierta_de(request.user, empresa)
+     return {'sesion_caja_activa': sesion}
+--- a/cashregister/views.py
++++ b/cashregister/views.py
+@@ -26,7 +26,8 @@
+ from core.modulos import requiere_modulo
+ 
+ from . import services
+-from .forms import CashMovementForm, CashSessionOpenForm
++from .forms import CashMovementForm, CashSessionOpenForm, CashSessionCloseForm
++from .daily import expirar_sesiones, validar_sesion_actual
+ from .models import CashMovement, CashSession
+ from .tenant_utils import obtener_empresa_actual
+ 
+@@ -42,12 +43,13 @@
+     """Solo el responsable de la caja o un administrador pueden cerrarla
+     (mismo criterio que ya usa `movement_create` para registrar
+     movimientos: nunca en la caja de otro usuario, salvo administrador)."""
+-    return usuario.es_admin or sesion.usuario_id == usuario.id
++    return usuario.is_superuser or usuario.rol_en(sesion.empresa) == 'admin' or sesion.usuario_id == usuario.id
+ 
+ 
+ def _serializar_sesion(sesion):
+     return {
+         'numero': sesion.numero,
++        'business_date': sesion.business_date.isoformat(),
+         'usuario': sesion.usuario.get_full_name() or sesion.usuario.username,
+         'fecha_apertura': sesion.fecha_apertura.strftime('%d/%m/%Y %H:%M'),
+         'saldo_inicial': str(sesion.saldo_inicial),
+@@ -63,9 +65,7 @@
+ def cash_status(request):
+     """Estado de caja del usuario actual, en JSON (para el modal)."""
+     empresa = obtener_empresa_actual(request)
+-    sesion = CashSession.objects.filter(
+-        usuario=request.user, empresa=empresa, estado=CashSession.Estado.ABIERTA,
+-    ).first()
++    sesion = services.caja_abierta_de(request.user, empresa)
+     return JsonResponse({
+         'abierta': sesion is not None,
+         'sesion': _serializar_sesion(sesion) if sesion else None,
+@@ -85,9 +85,7 @@
+     informativo en vez de un mensaje de error.
+     """
+     empresa = obtener_empresa_actual(request)
+-    sesion_existente = CashSession.objects.filter(
+-        usuario=request.user, empresa=empresa, estado=CashSession.Estado.ABIERTA,
+-    ).first()
++    sesion_existente = services.caja_abierta_de(request.user, empresa)
+     if sesion_existente:
+         return JsonResponse({'ok': False, 'ya_abierta': True, 'sesion': _serializar_sesion(sesion_existente)})
+ 
+@@ -101,14 +99,16 @@
+             sesion.empresa = empresa
+             sesion.usuario = request.user
+             sesion.save()
++    except ValueError as error:
++        return JsonResponse({'ok': False, 'error': str(error)}, status=400)
+     except IntegrityError:
+         # Carrera: se abrió otra caja para este usuario justo entre la
+         # verificación de arriba y el guardado (ej. doble clic muy
+         # rápido, o dos pestañas). El constraint de BD lo impide;
+         # respondemos igual que si ya existiera, sin mostrar error.
+-        sesion_existente = CashSession.objects.filter(
+-            usuario=request.user, empresa=empresa, estado=CashSession.Estado.ABIERTA,
+-        ).first()
++        sesion_existente = services.caja_abierta_de(request.user, empresa)
++        if sesion_existente is None:
++            return JsonResponse({'ok': False, 'error': 'No se pudo abrir la caja. Intenta nuevamente.'}, status=409)
+         return JsonResponse({'ok': False, 'ya_abierta': True, 'sesion': _serializar_sesion(sesion_existente)})
+ 
+     return JsonResponse({
+@@ -144,6 +144,7 @@
+ 
+ @login_required
+ @role_required(*ROLES_CAJA)
++@requiere_modulo('caja')
+ def session_detail(request, pk):
+     """Detalle de una sesión de caja (estado, fecha, saldo, responsable).
+     Solo si la sesión pertenece a la empresa actual.
+@@ -153,6 +154,7 @@
+     mostrarlo en pantalla junto a los botones de exportación.
+     """
+     empresa = obtener_empresa_actual(request)
++    expirar_sesiones(empresa)
+     sesion = get_object_or_404(CashSession, pk=pk, empresa=empresa)
+     resumen, movimientos = _calcular_resumen(sesion)
+     puede_registrar_movimientos = (
+@@ -174,11 +176,13 @@
+ @login_required
+ @role_required(*ROLES_CAJA)
+ @require_GET
++@requiere_modulo('caja')
+ def movement_list(request, pk):
+     """Lista de movimientos + resumen de una sesión de caja, en JSON
+     (para refrescar la tabla y las tarjetas de resumen sin recargar).
+     Solo si la sesión pertenece a la empresa actual."""
+     empresa = obtener_empresa_actual(request)
++    expirar_sesiones(empresa)
+     sesion = get_object_or_404(CashSession, pk=pk, empresa=empresa)
+     resumen, movimientos = _calcular_resumen(sesion)
+     return JsonResponse({
+@@ -190,6 +194,7 @@
+ @login_required
+ @role_required(*ROLES_CAJA)
+ @require_POST
++@requiere_modulo('caja')
+ def movement_create(request, pk):
+     """Registra un movimiento de caja (AJAX, desde el modal).
+ 
+@@ -201,6 +206,7 @@
+       usuario, ni siquiera pasando su `pk` por la URL).
+     """
+     empresa = obtener_empresa_actual(request)
++    expirar_sesiones(empresa)
+     sesion = get_object_or_404(CashSession, pk=pk, empresa=empresa)
+ 
+     if sesion.estado != CashSession.Estado.ABIERTA:
+@@ -218,11 +224,16 @@
+     if not form.is_valid():
+         return JsonResponse({'ok': False, 'errors': form.errors}, status=400)
+ 
+-    with transaction.atomic():
+-        movimiento = form.save(commit=False)
+-        movimiento.sesion = sesion
+-        movimiento.usuario = request.user
+-        movimiento.save()
++    try:
++        with transaction.atomic():
++            sesion = validar_sesion_actual(sesion, request.user, empresa, roles=ROLES_CAJA)
++            movimiento = form.save(commit=False)
++            movimiento.sesion = sesion
++            movimiento.usuario = request.user
++            movimiento.save()
++    except ValueError as error:
++        expirar_sesiones(empresa)
++        return JsonResponse({'ok': False, 'error': str(error)}, status=409)
+ 
+     resumen, movimientos = _calcular_resumen(sesion)
+     return JsonResponse({
+@@ -238,6 +249,7 @@
+ 
+ @login_required
+ @role_required(*ROLES_CAJA)
++@requiere_modulo('caja')
+ def session_close(request, pk):
+     """Confirmación (GET) y ejecución (POST) del cierre de una sesión
+     de caja. Solo si la sesión pertenece a la empresa actual. Igual
+@@ -249,6 +261,7 @@
+     la sesión deja de admitir nuevos movimientos o ventas en efectivo.
+     """
+     empresa = obtener_empresa_actual(request)
++    expirar_sesiones(empresa)
+     sesion = get_object_or_404(CashSession, pk=pk, empresa=empresa)
+ 
+     if not _puede_cerrar_caja(request.user, sesion):
+@@ -259,9 +272,10 @@
+         messages.warning(request, 'Esta caja ya está cerrada.')
+         return redirect('cashregister:session_detail', pk=sesion.pk)
+ 
+-    if request.method == 'POST':
++    form_cierre = CashSessionCloseForm(request.POST if request.method == 'POST' else None)
++    if request.method == 'POST' and form_cierre.is_valid():
+         try:
+-            services.cerrar_caja(sesion)
++            services.cerrar_caja(sesion, form_cierre.cantidades, usuario=request.user)
+         except ValueError as error:
+             messages.error(request, str(error))
+             return redirect('cashregister:session_detail', pk=sesion.pk)
+@@ -276,11 +290,13 @@
+         'ventas_por_metodo': ventas_por_metodo,
+         'total_ventas': total_ventas,
+         'seccion_activa': 'caja',
+-    })
+-
+-
+-@login_required
+-@role_required(*ROLES_CAJA)
++        'form_cierre': form_cierre,
++    })
++
++
++@login_required
++@role_required(*ROLES_CAJA)
++@requiere_modulo('caja')
+ def session_close_pdf(request, pk):
+     """Reporte de cierre de caja en PDF, con logo y datos de la
+     empresa (reutiliza `core.pdf` y la configuración de empresa, igual
+@@ -289,6 +305,7 @@
+     from .pdf import generar_pdf_cierre
+ 
+     empresa = obtener_empresa_actual(request)
++    expirar_sesiones(empresa)
+     sesion = get_object_or_404(CashSession, pk=pk, empresa=empresa)
+     datos = services.generar_datos_cierre(sesion)
+     config = obtener_configuracion_empresa(empresa)
+@@ -297,6 +314,7 @@
+ 
+ @login_required
+ @role_required(*ROLES_CAJA)
++@requiere_modulo('caja')
+ def session_close_ticket(request, pk):
+     """Cierre de caja en formato ticket térmico (58/80 mm), para
+     impresión POS. Solo si la sesión pertenece a la empresa actual.
+@@ -305,6 +323,7 @@
+     mantener una sola identidad visual de impresión en todo el ERP.
+     """
+     empresa = obtener_empresa_actual(request)
++    expirar_sesiones(empresa)
+     sesion = get_object_or_404(CashSession, pk=pk, empresa=empresa)
+     datos = services.generar_datos_cierre(sesion)
+     config = obtener_configuracion_empresa(empresa)
+--- a/sales/models.py
++++ b/sales/models.py
+@@ -17,7 +17,7 @@
+ from decimal import Decimal
+ 
+ from django.conf import settings
+-from django.db import models
++from django.db import models, transaction
+ 
+ from clients.models import Client
+ from inventory.models import Product
+@@ -140,8 +140,21 @@
+         verbose_name_plural = 'Ventas'
+         ordering = ['-fecha']
+ 
++    def save(self, *args, **kwargs):
++        # Solo la creación/finalización exige caja: no bloquea consulta,
++        # anulación o mantenimiento de ventas históricas ya completadas.
++        finalizar = self.estado == self.Estado.COMPLETADA and (
++            self._state.adding or type(self).objects.filter(pk=self.pk, estado=self.Estado.PENDIENTE).exists()
++        )
++        if finalizar:
++            from cashregister.daily import validar_sesion_actual
++            with transaction.atomic():
++                validar_sesion_actual(self.sesion_caja, self.vendedor, self.empresa, roles=('admin', 'vendedor', 'cajero', 'tecnico'))
++                return super().save(*args, **kwargs)
++        return super().save(*args, **kwargs)
++
+     def __str__(self):
+-        return f'Venta #{self.pk} - {self.cliente.nombre_completo}'
++        return f'Venta #{self.pk} - {self.cliente.nombre_completo}' 
+ 
+     @property
+     def numero(self):
+@@ -178,6 +191,8 @@
+             return
+ 
+         from company.models import Company, InvoiceSettings
++        from cashregister.daily import validar_sesion_actual
++        validar_sesion_actual(self.sesion_caja, self.vendedor, self.empresa, roles=('admin', 'vendedor', 'cajero', 'tecnico'))
+ 
+         empresa = Company.para_empresa(self.empresa)
+         # Garantiza que exista la fila antes de bloquearla; select_for_update
+@@ -421,5 +436,12 @@
+         verbose_name_plural = 'Pagos de venta'
+         ordering = ['id']
+ 
++    def save(self, *args, **kwargs):
++        from cashregister.daily import validar_sesion_actual
++        with transaction.atomic():
++            validar_sesion_actual(self.venta.sesion_caja, self.venta.vendedor, self.venta.empresa,
++                                  roles=('admin', 'vendedor', 'cajero', 'tecnico'))
++            return super().save(*args, **kwargs)
++
+     def __str__(self):
+-        return f'{self.metodo_pago.nombre}: {self.valor}'
++        return f'{self.metodo_pago.nombre}: {self.valor}' 
+--- a/purchases/services.py
++++ b/purchases/services.py
+@@ -94,6 +94,9 @@
+             )
+ 
+     with transaction.atomic():
++        if compra.forma_pago == Compra.FormaPago.CONTADO:
++            from cashregister.daily import validar_sesion_actual
++            sesion_caja = validar_sesion_actual(sesion_caja, usuario or compra.creado_por, compra.empresa, roles=('admin', 'vendedor', 'compras'))
+         # 1) Inventario: entra el stock de cada ítem en la empresa que
+         #    compra, vía el servicio reutilizable (nunca se toca
+         #    ProductoEmpresa directamente aquí) — Fase N.
+--- a/templates/cashregister/_denominations.html
++++ b/templates/cashregister/_denominations.html
+@@ -0,0 +1,60 @@
++{% load cash_denominations %}
++<div class="cash-arqueo text-start" data-cash-arqueo {% if esperado %}data-esperado="{{ esperado }}"{% endif %}>
++  <div class="row g-3">
++    <div class="col-12 col-md-6"><div class="card h-100 border-0 shadow-sm">
++      <div class="card-header fw-semibold"><i class="bi bi-cash-stack me-2"></i>BILLETES</div>
++      <div class="table-responsive"><table class="table table-sm align-middle mb-0">
++      <thead><tr><th>Denominación</th><th>Cantidad</th><th class="text-end">Subtotal</th></tr></thead><tbody>
++      <tr><td><label for="{{ prefijo }}_cantidad_200000">$200.000</label></td>
++      <td><input id="{{ prefijo }}_cantidad_200000" name="cantidad_200000" type="number" min="0" max="999999999" step="1" inputmode="numeric" required value="{{ form_arqueo|cantidad_arqueo:200000 }}" class="form-control form-control-sm" data-denominacion="200000" aria-label="Cantidad de $200.000" style="min-width:64px;max-width:96px"></td>
++      <td class="text-end small text-nowrap" data-subtotal="200000">$0</td></tr>
++      <tr><td><label for="{{ prefijo }}_cantidad_100000">$100.000</label></td>
++      <td><input id="{{ prefijo }}_cantidad_100000" name="cantidad_100000" type="number" min="0" max="999999999" step="1" inputmode="numeric" required value="{{ form_arqueo|cantidad_arqueo:100000 }}" class="form-control form-control-sm" data-denominacion="100000" aria-label="Cantidad de $100.000" style="min-width:64px;max-width:96px"></td>
++      <td class="text-end small text-nowrap" data-subtotal="100000">$0</td></tr>
++      <tr><td><label for="{{ prefijo }}_cantidad_50000">$50.000</label></td>
++      <td><input id="{{ prefijo }}_cantidad_50000" name="cantidad_50000" type="number" min="0" max="999999999" step="1" inputmode="numeric" required value="{{ form_arqueo|cantidad_arqueo:50000 }}" class="form-control form-control-sm" data-denominacion="50000" aria-label="Cantidad de $50.000" style="min-width:64px;max-width:96px"></td>
++      <td class="text-end small text-nowrap" data-subtotal="50000">$0</td></tr>
++      <tr><td><label for="{{ prefijo }}_cantidad_20000">$20.000</label></td>
++      <td><input id="{{ prefijo }}_cantidad_20000" name="cantidad_20000" type="number" min="0" max="999999999" step="1" inputmode="numeric" required value="{{ form_arqueo|cantidad_arqueo:20000 }}" class="form-control form-control-sm" data-denominacion="20000" aria-label="Cantidad de $20.000" style="min-width:64px;max-width:96px"></td>
++      <td class="text-end small text-nowrap" data-subtotal="20000">$0</td></tr>
++      <tr><td><label for="{{ prefijo }}_cantidad_10000">$10.000</label></td>
++      <td><input id="{{ prefijo }}_cantidad_10000" name="cantidad_10000" type="number" min="0" max="999999999" step="1" inputmode="numeric" required value="{{ form_arqueo|cantidad_arqueo:10000 }}" class="form-control form-control-sm" data-denominacion="10000" aria-label="Cantidad de $10.000" style="min-width:64px;max-width:96px"></td>
++      <td class="text-end small text-nowrap" data-subtotal="10000">$0</td></tr>
++      <tr><td><label for="{{ prefijo }}_cantidad_5000">$5.000</label></td>
++      <td><input id="{{ prefijo }}_cantidad_5000" name="cantidad_5000" type="number" min="0" max="999999999" step="1" inputmode="numeric" required value="{{ form_arqueo|cantidad_arqueo:5000 }}" class="form-control form-control-sm" data-denominacion="5000" aria-label="Cantidad de $5.000" style="min-width:64px;max-width:96px"></td>
++      <td class="text-end small text-nowrap" data-subtotal="5000">$0</td></tr>
++      <tr><td><label for="{{ prefijo }}_cantidad_2000">$2.000</label></td>
++      <td><input id="{{ prefijo }}_cantidad_2000" name="cantidad_2000" type="number" min="0" max="999999999" step="1" inputmode="numeric" required value="{{ form_arqueo|cantidad_arqueo:2000 }}" class="form-control form-control-sm" data-denominacion="2000" aria-label="Cantidad de $2.000" style="min-width:64px;max-width:96px"></td>
++      <td class="text-end small text-nowrap" data-subtotal="2000">$0</td></tr>
++      </tbody></table></div></div></div>
++    <div class="col-12 col-md-6"><div class="card h-100 border-0 shadow-sm">
++      <div class="card-header fw-semibold"><i class="bi bi-coin me-2"></i>MONEDAS</div>
++      <div class="table-responsive"><table class="table table-sm align-middle mb-0">
++      <thead><tr><th>Denominación</th><th>Cantidad</th><th class="text-end">Subtotal</th></tr></thead><tbody>
++      <tr><td><label for="{{ prefijo }}_cantidad_1000">$1.000</label></td>
++      <td><input id="{{ prefijo }}_cantidad_1000" name="cantidad_1000" type="number" min="0" max="999999999" step="1" inputmode="numeric" required value="{{ form_arqueo|cantidad_arqueo:1000 }}" class="form-control form-control-sm" data-denominacion="1000" aria-label="Cantidad de $1.000" style="min-width:64px;max-width:96px"></td>
++      <td class="text-end small text-nowrap" data-subtotal="1000">$0</td></tr>
++      <tr><td><label for="{{ prefijo }}_cantidad_500">$500</label></td>
++      <td><input id="{{ prefijo }}_cantidad_500" name="cantidad_500" type="number" min="0" max="999999999" step="1" inputmode="numeric" required value="{{ form_arqueo|cantidad_arqueo:500 }}" class="form-control form-control-sm" data-denominacion="500" aria-label="Cantidad de $500" style="min-width:64px;max-width:96px"></td>
++      <td class="text-end small text-nowrap" data-subtotal="500">$0</td></tr>
++      <tr><td><label for="{{ prefijo }}_cantidad_200">$200</label></td>
++      <td><input id="{{ prefijo }}_cantidad_200" name="cantidad_200" type="number" min="0" max="999999999" step="1" inputmode="numeric" required value="{{ form_arqueo|cantidad_arqueo:200 }}" class="form-control form-control-sm" data-denominacion="200" aria-label="Cantidad de $200" style="min-width:64px;max-width:96px"></td>
++      <td class="text-end small text-nowrap" data-subtotal="200">$0</td></tr>
++      <tr><td><label for="{{ prefijo }}_cantidad_100">$100</label></td>
++      <td><input id="{{ prefijo }}_cantidad_100" name="cantidad_100" type="number" min="0" max="999999999" step="1" inputmode="numeric" required value="{{ form_arqueo|cantidad_arqueo:100 }}" class="form-control form-control-sm" data-denominacion="100" aria-label="Cantidad de $100" style="min-width:64px;max-width:96px"></td>
++      <td class="text-end small text-nowrap" data-subtotal="100">$0</td></tr>
++      <tr><td><label for="{{ prefijo }}_cantidad_50">$50</label></td>
++      <td><input id="{{ prefijo }}_cantidad_50" name="cantidad_50" type="number" min="0" max="999999999" step="1" inputmode="numeric" required value="{{ form_arqueo|cantidad_arqueo:50 }}" class="form-control form-control-sm" data-denominacion="50" aria-label="Cantidad de $50" style="min-width:64px;max-width:96px"></td>
++      <td class="text-end small text-nowrap" data-subtotal="50">$0</td></tr>
++      </tbody></table></div></div></div>
++  </div>
++  <div class="card mt-3 border-0 bg-body-tertiary"><div class="card-body">
++    <div class="d-flex justify-content-between align-items-center"><strong>{{ titulo_total|default:"TOTAL EFECTIVO" }}</strong><strong class="fs-4 text-success" data-arqueo-total>$0</strong></div>
++    <input type="hidden" id="{{ total_id|default:'id_saldo_inicial' }}" name="saldo_inicial" value="0" data-arqueo-total-input>
++    {% if es_cierre %}
++    <div class="d-flex justify-content-between border-top mt-2 pt-2"><span>EFECTIVO ESPERADO</span><strong data-arqueo-esperado>$0</strong></div>
++    <div class="d-flex justify-content-between"><span>DIFERENCIA <small>(contado − esperado)</small></span><strong data-arqueo-diferencia>$0</strong></div>
++    <small class="text-muted">Negativo: faltante. Positivo: sobrante.</small>
++    {% endif %}
++  </div></div>
++</div>
+--- a/cashregister/templatetags/cash_denominations.py
++++ b/cashregister/templatetags/cash_denominations.py
+@@ -0,0 +1,10 @@
++from django import template
++register = template.Library()
++
++
++@register.filter
++def cantidad_arqueo(form, denominacion):
++    if form:
++        value = form[f'cantidad_{denominacion}'].value()
++        return value if value is not None else 0
++    return 0
+--- a/static/js/cash_denominations.js
++++ b/static/js/cash_denominations.js
+@@ -0,0 +1,36 @@
++/** Arqueo físico. El servidor recalcula independientemente estos totales. */
++(function () {
++    'use strict';
++    const money = value => '$' + new Intl.NumberFormat('es-CO', {maximumFractionDigits: 2}).format(value);
++    function init() {
++        document.querySelectorAll('[data-cash-arqueo]').forEach(root => {
++            function update() {
++                let total = 0;
++                root.querySelectorAll('[data-denominacion]').forEach(input => {
++                    const raw = input.value;
++                    const valid = /^[0-9]{1,9}$/.test(raw);
++                    input.setCustomValidity(valid ? '' : 'Escribe un entero mayor o igual a cero, sin decimales.');
++                    const subtotal = valid ? Number(raw) * Number(input.dataset.denominacion) : 0;
++                    total += subtotal;
++                    root.querySelector('[data-subtotal="' + input.dataset.denominacion + '"]').textContent = money(subtotal);
++                });
++                root.querySelector('[data-arqueo-total]').textContent = money(total);
++                root.querySelector('[data-arqueo-total-input]').value = String(total);
++                const diff = root.querySelector('[data-arqueo-diferencia]');
++                if (diff) {
++                    const expected = Number((root.dataset.esperado || '0').replace(',', '.'));
++                    root.querySelector('[data-arqueo-esperado]').textContent = money(expected);
++                    const delta = total - expected;
++                    diff.textContent = (delta > 0 ? '+' : '') + money(delta);
++                    diff.classList.toggle('text-danger', delta < 0);
++                    diff.classList.toggle('text-success', delta >= 0);
++                }
++            }
++            root.addEventListener('input', update);
++            const form = root.closest('form');
++            if (form) form.addEventListener('reset', () => setTimeout(update, 0));
++            update();
++        });
++    }
++    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
++})();
+--- a/templates/base.html
++++ b/templates/base.html
+@@ -234,7 +234,7 @@
+                 <span class="erp-nav-label"><i class="bi bi-cash-coin"></i> <span class="erp-nav-text">Caja</span></span>
+                 <span class="d-flex align-items-center gap-1">
+                     <span id="cajaEstadoBadge" class="badge {% if sesion_caja_activa %}bg-success{% else %}bg-secondary{% endif %} rounded-pill">
+-                        {% if sesion_caja_activa %}Abierta{% else %}Cerrada{% endif %}
++                        {% if sesion_caja_activa %}CAJA ABIERTA{% else %}CAJA CERRADA{% endif %}
+                     </span>
+                     <i class="bi bi-chevron-down erp-submenu-caret"></i>
+                 </span>
+@@ -439,7 +439,7 @@
+ 
+     <!-- Modal: Abrir Caja -->
+     <div class="modal fade" id="modalAbrirCaja" tabindex="-1" aria-hidden="true">
+-        <div class="modal-dialog modal-dialog-centered">
++        <div class="modal-dialog modal-dialog-centered modal-lg">
+             <div class="modal-content">
+                 <div class="modal-header">
+                     <h5 class="modal-title"><i class="bi bi-cash-coin"></i> Abrir Caja</h5>
+@@ -448,11 +448,8 @@
+                 <form id="formAbrirCaja">
+                     <div class="modal-body">
+                         <div id="alertaAbrirCaja" class="alert alert-danger d-none" role="alert"></div>
+-                        <div class="mb-3">
+-                            <label class="form-label fw-semibold" for="id_saldo_inicial">Saldo inicial <span class="text-danger">*</span></label>
+-                            <input type="number" step="0.01" min="0" class="form-control" id="id_saldo_inicial" name="saldo_inicial" placeholder="0.00" required>
+-                            <div class="invalid-feedback" id="errorSaldoInicial"></div>
+-                        </div>
++                        {% include 'cashregister/_denominations.html' with prefijo='apertura' titulo_total='TOTAL EFECTIVO DE APERTURA' %}
++                        <div class="invalid-feedback" id="errorSaldoInicial"></div>
+                         <div class="mb-3">
+                             <label class="form-label fw-semibold" for="id_observaciones_caja">Observaciones</label>
+                             <textarea class="form-control" id="id_observaciones_caja" name="observaciones" rows="2" placeholder="Opcional"></textarea>
+@@ -623,6 +620,7 @@
+         }
+     </script>
+     <script src="{% static 'js/loading.js' %}"></script>
++    <script src="{% static 'js/cash_denominations.js' %}"></script>
+     <script src="{% static 'js/cash_register.js' %}"></script>
+     <script src="{% static 'js/toasts.js' %}"></script>
+     <script src="{% static 'js/sidebar.js' %}"></script>
+--- a/static/js/cash_register.js
++++ b/static/js/cash_register.js
+@@ -64,6 +64,11 @@
+                     if (data.abierta) {
+                         mostrarInfoCajaAbierta(data.sesion);
+                     } else {
++                        if (cajaEstadoBadge) {
++                            cajaEstadoBadge.textContent = 'CAJA CERRADA';
++                            cajaEstadoBadge.classList.remove('bg-success');
++                            cajaEstadoBadge.classList.add('bg-secondary');
++                        }
+                         formAbrirCaja.reset();
+                         alertaAbrirCaja.classList.add('d-none');
+                         inputSaldoInicial.classList.remove('is-invalid');
+@@ -104,7 +109,7 @@
+                         return;
+                     }
+                     if (cajaEstadoBadge) {
+-                        cajaEstadoBadge.textContent = 'Abierta';
++                        cajaEstadoBadge.textContent = 'CAJA ABIERTA';
+                         cajaEstadoBadge.classList.remove('bg-secondary');
+                         cajaEstadoBadge.classList.add('bg-success');
+                     }
+@@ -116,7 +121,7 @@
+                     inputSaldoInicial.classList.add('is-invalid');
+                     document.getElementById('errorSaldoInicial').textContent = data.errors.saldo_inicial[0];
+                 } else {
+-                    alertaAbrirCaja.textContent = 'No se pudo abrir la caja. Verifica los datos ingresados.';
++                    alertaAbrirCaja.textContent = data.error || (data.errors ? Object.values(data.errors).flat().join(' ') : 'No se pudo abrir la caja. Verifica los datos ingresados.');
+                     alertaAbrirCaja.classList.remove('d-none');
+                 }
+             })
+--- a/templates/cashregister/session_confirm_close.html
++++ b/templates/cashregister/session_confirm_close.html
+@@ -5,7 +5,7 @@
+ {% block content %}
+ {% with simbolo=company_config.simbolo_moneda|default:"$" %}
+ <div class="row justify-content-center">
+-    <div class="col-lg-7">
++    <div class="col-lg-10">
+         <div class="card border-warning">
+             <div class="card-body text-center p-4">
+                 <i class="bi bi-lock-fill text-warning" style="font-size: 3rem;"></i>
+@@ -56,10 +56,14 @@
+                 </div>
+                 {% endif %}
+ 
+-                <form method="post" class="d-flex justify-content-center gap-2 mt-3">
++                <form method="post" class="mt-3">
+                     {% csrf_token %}
++                    {% if form_cierre.errors %}<div class="alert alert-danger text-start">{{ form_cierre.errors }}</div>{% endif %}
++                    {% include 'cashregister/_denominations.html' with prefijo='cierre' total_id='id_efectivo_contado' titulo_total='EFECTIVO CONTADO' esperado=resumen_caja.saldo_actual es_cierre=True form_arqueo=form_cierre %}
++                    <div class="d-flex justify-content-center gap-2 mt-3">
+                     <a href="{% url 'cashregister:session_detail' sesion.pk %}" class="btn btn-outline-secondary">Cancelar</a>
+                     <button type="submit" class="btn btn-warning"><i class="bi bi-lock-fill"></i> Sí, cerrar caja</button>
++                    </div>
+                 </form>
+             </div>
+         </div>
+--- a/templates/cashregister/session_detail.html
++++ b/templates/cashregister/session_detail.html
+@@ -31,6 +31,19 @@
+             </div>
+             <div class="card-body">
+                 <dl class="row mb-0">
++                    <dt class="col-sm-5 text-muted">Fecha de operación</dt><dd class="col-sm-7">{{ sesion.business_date|date:"d/m/Y" }}</dd>
++                    {% if sesion.motivo_cierre %}<dt class="col-sm-5 text-muted">Motivo del cierre</dt><dd class="col-sm-7">{{ sesion.motivo_cierre }}</dd>{% endif %}
++                    {% if sesion.cierre_automatico_detectado_en %}<dt class="col-sm-5 text-muted">Cierre automático detectado</dt><dd class="col-sm-7">{{ sesion.cierre_automatico_detectado_en|date:"d/m/Y H:i" }}</dd>{% endif %}
++                    {% if sesion.efectivo_esperado != None %}<dt class="col-sm-5 text-muted">Efectivo esperado</dt><dd class="col-sm-7">{{ simbolo }}{{ sesion.efectivo_esperado }}</dd>{% endif %}
++                    {% if sesion.efectivo_contado != None %}
++                    <dt class="col-sm-5 text-muted">Efectivo contado</dt><dd class="col-sm-7">{{ simbolo }}{{ sesion.efectivo_contado }}</dd>
++                    <dt class="col-sm-5 text-muted">Diferencia</dt><dd class="col-sm-7 {% if sesion.diferencia < 0 %}text-danger{% else %}text-success{% endif %}">{{ simbolo }}{{ sesion.diferencia }}</dd>
++                    {% elif sesion.cierre_automatico %}<dt class="col-sm-5 text-muted">Arqueo físico</dt><dd class="col-sm-7">Sin conteo físico: cierre automático.</dd>{% endif %}
++                    {% if sesion.apertura_denominaciones %}
++                    <dt class="col-sm-5 text-muted">Denominaciones de apertura</dt><dd class="col-sm-7">{% for valor, cantidad in sesion.apertura_denominaciones.items %}<span class="badge bg-body-secondary text-body me-1 mb-1">${{ valor }} × {{ cantidad }}</span>{% endfor %}</dd>{% endif %}
++                    {% if sesion.cierre_denominaciones %}
++                    <dt class="col-sm-5 text-muted">Denominaciones de cierre</dt><dd class="col-sm-7">{% for valor, cantidad in sesion.cierre_denominaciones.items %}<span class="badge bg-body-secondary text-body me-1 mb-1">${{ valor }} × {{ cantidad }}</span>{% endfor %}</dd>{% endif %}
++
+                     <dt class="col-sm-5 fw-normal text-muted">Estado</dt>
+                     <dd class="col-sm-7">{{ sesion.get_estado_display }}</dd>
+ 
+--- a/templates/cashregister/session_close_ticket.html
++++ b/templates/cashregister/session_close_ticket.html
+@@ -137,7 +137,16 @@
+             </tbody>
+         </table>
+ 
+-        <div class="footer-msg">Cierre generado automáticamente</div>
++        <hr><div class="doc-title">ARQUEO FÍSICO</div>
++        <div>Fecha de operación: {{ sesion.business_date|date:"d/m/Y" }}</div>
++        <div>{{ sesion.motivo_cierre }}</div>
++        {% if sesion.efectivo_esperado != None %}<div>Esperado: {{ empresa.simbolo_moneda }}{{ sesion.efectivo_esperado }}</div>{% endif %}
++        {% if sesion.efectivo_contado != None %}
++        <div>Contado: {{ empresa.simbolo_moneda }}{{ sesion.efectivo_contado }}</div>
++        <div>Diferencia: {{ empresa.simbolo_moneda }}{{ sesion.diferencia }}</div>
++        {% else %}<div>Sin conteo físico registrado.</div>{% endif %}
++        {% for valor, cantidad in sesion.cierre_denominaciones.items %}<div>${{ valor }} × {{ cantidad }}</div>{% endfor %}
++        <div class="footer-msg">Comprobante de cierre de caja</div>
+         <div class="legal">Este comprobante no reemplaza los documentos legales de cada venta.</div>
+         <div class="firma-box">
+             <div class="firma-linea"></div>
+--- a/cashregister/pdf.py
++++ b/cashregister/pdf.py
+@@ -103,6 +103,20 @@
+         ['Total egresos', _moneda(simbolo, datos['total_egresos_caja'])],
+         ['Saldo final', _moneda(simbolo, datos['saldo_final'])],
+     ]
++    resumen_filas.append(['Fecha de operación', sesion.business_date.strftime('%d/%m/%Y')])
++    if sesion.efectivo_esperado is not None:
++        resumen_filas.append(['Efectivo esperado', _moneda(simbolo, sesion.efectivo_esperado)])
++    if sesion.efectivo_contado is not None:
++        resumen_filas.extend([
++            ['Efectivo contado', _moneda(simbolo, sesion.efectivo_contado)],
++            ['Diferencia', _moneda(simbolo, sesion.diferencia)],
++        ])
++    else:
++        resumen_filas.append(['Arqueo físico', 'Sin conteo físico registrado'])
++    if sesion.cierre_automatico:
++        resumen_filas.append(['Motivo', 'Cierre automático por cambio de día'])
++    for valor, cantidad in sesion.cierre_denominaciones.items():
++        resumen_filas.append([f'Denominación ${int(valor):,}'.replace(',', '.'), str(cantidad)])
+     tabla_resumen = Table(resumen_filas, colWidths=[220, 200])
+     tabla_resumen.setStyle(TableStyle([
+         ('FONTSIZE', (0, 0), (-1, -1), 10),
+--- a/cashregister/migrations/0010_daily_cash_and_denominations.py
++++ b/cashregister/migrations/0010_daily_cash_and_denominations.py
+@@ -0,0 +1,41 @@
++from zoneinfo import ZoneInfo
++from django.db import migrations, models
++from django.utils import timezone
++
++
++def backfill(apps, schema_editor):
++    alias = schema_editor.connection.alias
++    Empresa = apps.get_model('tenants', 'Empresa')
++    zonas = dict(Empresa.objects.using(alias).values_list('pk', 'zona_horaria'))
++    for model_name in ('CashSession', 'HistoricalCashSession'):
++        Model = apps.get_model('cashregister', model_name)
++        for row in Model.objects.using(alias).all().iterator():
++            zone = ZoneInfo(zonas.get(row.empresa_id) or 'America/Bogota')
++            fecha = row.fecha_apertura
++            if timezone.is_naive(fecha):
++                fecha = timezone.make_aware(fecha, zone)
++            Model.objects.using(alias).filter(pk=row.pk).update(business_date=timezone.localtime(fecha, zone).date())
++
++
++class Migration(migrations.Migration):
++    dependencies = [('cashregister', '0009_alter_historicalcashmovement_compra_relacionada')]
++    operations = []
++    for model_name in ('cashsession', 'historicalcashsession'):
++        operations += [
++            migrations.AddField(model_name=model_name, name='business_date', field=models.DateField('Fecha de operación', null=True, db_index=True)),
++            migrations.AddField(model_name=model_name, name='apertura_denominaciones', field=models.JSONField('Arqueo de apertura', default=dict, blank=True)),
++            migrations.AddField(model_name=model_name, name='cierre_denominaciones', field=models.JSONField('Arqueo de cierre', default=dict, blank=True)),
++            migrations.AddField(model_name=model_name, name='efectivo_esperado', field=models.DecimalField('Efectivo esperado', max_digits=12, decimal_places=2, null=True, blank=True)),
++            migrations.AddField(model_name=model_name, name='efectivo_contado', field=models.DecimalField('Efectivo contado', max_digits=12, decimal_places=2, null=True, blank=True)),
++            migrations.AddField(model_name=model_name, name='diferencia', field=models.DecimalField('Diferencia', max_digits=12, decimal_places=2, null=True, blank=True)),
++            migrations.AddField(model_name=model_name, name='cierre_automatico', field=models.BooleanField('Cierre automático', default=False)),
++            migrations.AddField(model_name=model_name, name='motivo_cierre', field=models.CharField('Motivo del cierre', max_length=150, blank=True)),
++            migrations.AddField(model_name=model_name, name='cierre_automatico_detectado_en', field=models.DateTimeField('Detección del cierre automático', null=True, blank=True)),
++        ]
++    operations += [migrations.RunPython(backfill, migrations.RunPython.noop)]
++    for model_name in ('cashsession', 'historicalcashsession'):
++        operations += [migrations.AlterField(model_name=model_name, name='business_date', field=models.DateField('Fecha de operación', default=timezone.localdate, db_index=True))]
++    operations += [
++        migrations.RemoveConstraint(model_name='cashsession', name='unica_caja_abierta_por_usuario'),
++        migrations.AddConstraint(model_name='cashsession', constraint=models.UniqueConstraint(fields=('usuario', 'empresa'), condition=models.Q(estado='abierta'), name='unica_caja_abierta_por_usuario_empresa')),
++    ]
+--- a/cashregister/test_daily_cash.py
++++ b/cashregister/test_daily_cash.py
+@@ -0,0 +1,227 @@
++"""Regresión diaria: ejecutar con manage.py test cashregister.test_daily_cash."""
++from datetime import datetime, timezone as dt_timezone
++from decimal import Decimal
++from unittest.mock import patch
++
++from django.db import transaction
++from django.test import TestCase, override_settings, RequestFactory
++from django.utils import timezone
++
++from accounts.models import CustomUser
++from tenants.models import Empresa
++from platform_admin.models import Modulo, EmpresaModulo
++from clients.models import Client
++from sales.models import Sale
++from .models import CashSession, CashMovement
++from .forms import CashSessionOpenForm, CashSessionCloseForm
++from .denominations import DENOMINACIONES, calcular_arqueo
++from .daily import expirar_sesiones, validar_sesion_actual, fecha_operacion
++from .services import caja_abierta_de, cerrar_caja
++from .middleware import DailyCashMiddleware
++from .views import cash_open, movement_create, session_detail
++
++DAY1 = datetime(2026, 10, 2, 15, tzinfo=dt_timezone.utc)
++DAY2 = datetime(2026, 10, 3, 15, tzinfo=dt_timezone.utc)
++
++
++def arqueo(**valores):
++    return {str(d): valores.get(str(d), 0) for d in DENOMINACIONES}
++
++
++@override_settings(TIME_ZONE='America/Bogota', USE_TZ=True)
++class DailyCashTests(TestCase):
++    def setUp(self):
++        self.clock = patch('django.utils.timezone.now', return_value=DAY1)
++        self.now = self.clock.start()
++        self.addCleanup(self.clock.stop)
++        self.empresa = Empresa.objects.create(nombre_comercial='Caja A', nit='100', estado='activa')
++        self.otra = Empresa.objects.create(nombre_comercial='Caja B', nit='200', estado='activa')
++        self.usuario = CustomUser.objects.create_user(username='cajero', password='clave', empresa=self.empresa, role='cajero')
++        self.otro_usuario = CustomUser.objects.create_user(username='otro', password='clave', empresa=self.otra, role='cajero')
++        self.modulo, _ = Modulo.objects.get_or_create(codigo='caja', defaults={'nombre': 'Caja'})
++        EmpresaModulo.objects.update_or_create(empresa=self.empresa, modulo=self.modulo, defaults={'activo': True})
++        EmpresaModulo.objects.update_or_create(empresa=self.otra, modulo=self.modulo, defaults={'activo': True})
++        self.cliente = Client.objects.create(empresa=self.empresa, nombre='Cliente', documento='123')
++        self.sesion = self.abrir()
++
++    def abrir(self):
++        return CashSession.objects.create(
++            empresa=self.empresa, usuario=self.usuario, saldo_inicial=999,
++            apertura_denominaciones=arqueo(**{'100000': 2, '50000': 1}),
++        )
++
++    def venta(self, sesion=None):
++        return Sale.objects.create(
++            empresa=self.empresa, cliente=self.cliente, vendedor=self.usuario,
++            sesion_caja=sesion or self.sesion, total=1000,
++        )
++
++    def test_a_apertura_y_total_del_backend(self):
++        self.assertEqual(self.sesion.business_date.isoformat(), '2026-10-02')
++        self.assertEqual(self.sesion.saldo_inicial, Decimal('250000'))
++        self.assertEqual(caja_abierta_de(self.usuario, self.empresa).pk, self.sesion.pk)
++
++    def test_b_venta_dia_actual(self):
++        self.assertEqual(self.venta().sesion_caja_id, self.sesion.pk)
++
++    def test_c_sesion_anterior_no_operable(self):
++        self.now.return_value = DAY2
++        with transaction.atomic(), self.assertRaises(ValueError):
++            validar_sesion_actual(self.sesion, self.usuario, self.empresa)
++
++    def test_d_requiere_nueva_apertura(self):
++        self.now.return_value = DAY2
++        self.assertIsNone(caja_abierta_de(self.usuario, self.empresa))
++        self.sesion.refresh_from_db()
++        self.assertEqual(self.sesion.estado, 'cerrada')
++        self.assertEqual(self.sesion.motivo_cierre, 'Cierre automático por cambio de día')
++
++    def test_e_apertura_dia_siguiente(self):
++        self.now.return_value = DAY2
++        expirar_sesiones(self.empresa)
++        nueva = self.abrir()
++        self.assertNotEqual(nueva.pk, self.sesion.pk)
++        self.assertEqual(nueva.business_date.isoformat(), '2026-10-03')
++        self.assertEqual(self.venta(nueva).sesion_caja_id, nueva.pk)
++
++    def test_f_venta_sin_caja(self):
++        with self.assertRaisesMessage(ValueError, 'CAJA CERRADA'):
++            Sale.objects.create(empresa=self.empresa, cliente=self.cliente, vendedor=self.usuario, total=1)
++
++    def test_g_cierre_esperado_contado_diferencia_auditoria(self):
++        CashMovement.objects.create(sesion=self.sesion, usuario=self.usuario, tipo='ingreso', concepto='Ingreso', valor=1000)
++        cerrar_caja(self.sesion, arqueo(**{'100000': 2, '50000': 1}), usuario=self.usuario)
++        self.sesion.refresh_from_db()
++        self.assertEqual(self.sesion.efectivo_esperado, Decimal('251000'))
++        self.assertEqual(self.sesion.efectivo_contado, Decimal('250000'))
++        self.assertEqual(self.sesion.diferencia, Decimal('-1000'))
++        self.assertEqual(self.sesion.historial.first().diferencia, Decimal('-1000'))
++        self.assertEqual(self.sesion.historial.first().history_user_id, self.usuario.pk)
++
++    def test_h_servidor_apagado_deteccion_tardia(self):
++        self.now.return_value = DAY2
++        request = RequestFactory().get('/')
++        request.user, request.empresa = self.usuario, self.empresa
++        DailyCashMiddleware(lambda r: None)(request)
++        self.sesion.refresh_from_db()
++        cierre_local = timezone.localtime(self.sesion.fecha_cierre)
++        self.assertEqual(cierre_local.isoformat(), '2026-10-03T00:00:00-05:00')
++        self.assertEqual(self.sesion.cierre_automatico_detectado_en, DAY2)
++        self.assertIsNone(self.sesion.efectivo_contado)
++        self.assertIsNone(self.sesion.diferencia)
++
++    def test_i_aislamiento_entre_empresas(self):
++        with transaction.atomic(), self.assertRaises(ValueError):
++            validar_sesion_actual(self.sesion, self.otro_usuario, self.otra)
++        self.assertIsNone(caja_abierta_de(self.usuario, self.otra))
++
++    def test_movimiento_rechazado_en_caja_vencida(self):
++        self.now.return_value = DAY2
++        with self.assertRaises(ValueError):
++            CashMovement.objects.create(sesion=self.sesion, usuario=self.usuario, tipo='ingreso', concepto='Inválido', valor=10)
++        self.assertFalse(self.sesion.movimientos.exists())
++
++    def test_venta_rechazada_en_caja_vencida_incluso_no_efectivo(self):
++        self.now.return_value = DAY2
++        with self.assertRaises(ValueError):
++            Sale.objects.create(empresa=self.empresa, cliente=self.cliente, vendedor=self.usuario,
++                                sesion_caja=self.sesion, metodo_pago='transferencia', total=100)
++
++    def test_cierre_cero_es_conteo_real(self):
++        cerrar_caja(self.sesion, arqueo(), usuario=self.usuario)
++        self.assertEqual(self.sesion.efectivo_contado, 0)
++        self.assertEqual(self.sesion.diferencia, -250000)
++
++    def test_cierre_sobrante(self):
++        cerrar_caja(self.sesion, arqueo(**{'100000': 3}), usuario=self.usuario)
++        self.assertEqual(self.sesion.diferencia, 50000)
++
++    def test_expiracion_idempotente_conserva_movimientos(self):
++        CashMovement.objects.create(sesion=self.sesion, usuario=self.usuario, tipo='ingreso', concepto='Ingreso', valor=100)
++        self.now.return_value = DAY2
++        expirar_sesiones(self.empresa)
++        n = self.sesion.historial.count()
++        expirar_sesiones(self.empresa)
++        self.assertEqual(self.sesion.historial.count(), n)
++        self.assertEqual(self.sesion.movimientos.count(), 1)
++
++    def test_formularios_rechazan_negativos_decimales_y_ausentes(self):
++        for clase in (CashSessionOpenForm, CashSessionCloseForm):
++            for valor in ('-1', '1.0', '1.5', 'abc', ''):
++                data = {f'cantidad_{d}': '0' for d in DENOMINACIONES}
++                data['cantidad_1000'] = valor
++                self.assertFalse(clase(data).is_valid(), (clase, valor))
++            self.assertFalse(clase({'saldo_inicial': 10000}).is_valid())
++
++    def test_total_post_manipulado_no_se_utiliza(self):
++        data = {f'cantidad_{d}': '0' for d in DENOMINACIONES}
++        data.update(cantidad_1000='5', saldo_inicial='999999')
++        form = CashSessionOpenForm(data)
++        self.assertTrue(form.is_valid(), form.errors)
++        self.assertEqual(form.save(commit=False).saldo_inicial, 5000)
++
++    def test_permiso_revocado(self):
++        self.usuario.role = 'tecnico'
++        self.usuario.save()
++        with self.assertRaises(ValueError):
++            CashMovement.objects.create(sesion=self.sesion, usuario=self.usuario, tipo='ingreso', concepto='Sin permiso', valor=1)
++
++    def test_modulo_desactivado_bloquea_venta(self):
++        EmpresaModulo.objects.filter(empresa=self.empresa, modulo=self.modulo).update(activo=False)
++        with self.assertRaises(ValueError):
++            self.venta()
++
++    def test_zona_horaria_de_empresa(self):
++        self.now.return_value = datetime(2026, 10, 3, 2, tzinfo=dt_timezone.utc)
++        self.assertEqual(fecha_operacion(self.empresa).isoformat(), '2026-10-02')
++
++    def test_caja_futura_no_activa(self):
++        CashSession.objects.filter(pk=self.sesion.pk).update(business_date=datetime(2026, 10, 4).date())
++        self.assertIsNone(caja_abierta_de(self.usuario, self.empresa))
++
++    def test_movimiento_ajax_url_de_otra_empresa(self):
++        from django.http import Http404
++        request = RequestFactory().post('/caja/')
++        request.user, request.empresa, request.rol_en_empresa = self.otro_usuario, self.otra, 'cajero'
++        with self.assertRaises(Http404):
++            movement_create(request, self.sesion.pk)
++
++    def test_detalle_url_de_otra_empresa(self):
++        from django.http import Http404
++        request = RequestFactory().get('/caja/')
++        request.user, request.empresa, request.rol_en_empresa = self.otro_usuario, self.otra, 'cajero'
++        with self.assertRaises(Http404):
++            session_detail(request, self.sesion.pk)
++
++    def test_apertura_ajax_calcula_y_asigna_fecha(self):
++        cerrar_caja(self.sesion, arqueo(), usuario=self.usuario)
++        data = {f'cantidad_{d}': '0' for d in DENOMINACIONES}
++        data.update(cantidad_500='2', saldo_inicial='99999')
++        request = RequestFactory().post('/caja/abrir/', data)
++        request.user, request.empresa, request.rol_en_empresa = self.usuario, self.empresa, 'cajero'
++        response = cash_open(request)
++        self.assertEqual(response.status_code, 200)
++        actual = caja_abierta_de(self.usuario, self.empresa)
++        self.assertEqual(actual.saldo_inicial, 1000)
++        self.assertEqual(actual.business_date.isoformat(), '2026-10-02')
++
++    def test_pago_rechazado_al_dia_siguiente(self):
++        from company.models import PaymentMethod
++        from sales.models import SalePayment
++        venta = self.venta()
++        self.now.return_value = DAY2
++        with self.assertRaisesMessage(ValueError, 'CAJA CERRADA'):
++            SalePayment(venta=venta, valor=100).save()
++
++    def test_sesion_cerrada_no_recibe_movimientos(self):
++        cerrar_caja(self.sesion, arqueo(), usuario=self.usuario)
++        with self.assertRaisesMessage(ValueError, 'CAJA CERRADA'):
++            CashMovement.objects.create(sesion=self.sesion, usuario=self.usuario, tipo='ingreso', concepto='Después', valor=1)
++
++    def test_medianoche_exacta_invalida_sesion(self):
++        self.now.return_value = datetime(2026, 10, 3, 5, tzinfo=dt_timezone.utc)
++        self.assertIsNone(caja_abierta_de(self.usuario, self.empresa))
++
++    def test_antes_de_medianoche_sigue_activa(self):
++        self.now.return_value = datetime(2026, 10, 3, 4, 59, 59, tzinfo=dt_timezone.utc)
++        self.assertEqual(caja_abierta_de(self.usuario, self.empresa).pk, self.sesion.pk)
+--- a/cashregister/test_denominations_pure.py
++++ b/cashregister/test_denominations_pure.py
+@@ -0,0 +1,26 @@
++"""Ejecutable sin Django: python -m unittest cashregister.test_denominations_pure -v."""
++import unittest
++from .denominations import DENOMINACIONES, calcular_arqueo
++
++class DenominationTests(unittest.TestCase):
++    def data(self): return {str(d): 0 for d in DENOMINACIONES}
++    def test_ejemplo_316000(self):
++        d = self.data(); d.update({'100000':2,'50000':1,'20000':3,'1000':5,'500':2})
++        self.assertEqual(calcular_arqueo(d)[1], 316000)
++    def test_cero(self): self.assertEqual(calcular_arqueo(self.data())[1], 0)
++    def test_enteros_invalidos(self):
++        for value in [-1,1.0,1.5,'1.0',True,None,'','abc','1e3','+1',' 1']:
++            with self.subTest(value=value):
++                d=self.data(); d['1000']=value
++                with self.assertRaises(ValueError): calcular_arqueo(d)
++    def test_faltantes(self):
++        with self.assertRaises(ValueError): calcular_arqueo({})
++    def test_extra(self):
++        d=self.data(); d['10']=1
++        with self.assertRaises(ValueError): calcular_arqueo(d)
++    def test_maximo(self):
++        d=self.data(); d['200000']=999999999
++        with self.assertRaises(ValueError): calcular_arqueo(d)
++    def test_normalizacion(self):
++        d={str(x):'0' for x in DENOMINACIONES}; d['500']='002'
++        self.assertEqual(calcular_arqueo(d)[0]['500'],2)

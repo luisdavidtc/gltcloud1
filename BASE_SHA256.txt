@@ -1,0 +1,3 @@
+98f6c80aafd0774554efbad561c9782940cd7af583200f082a59580d2cd52361  templates/sales/sale_form.html
+c319a77e9939a11abb0e2b5cc86fac660670467b1f19e19814b9b18bb48d6bc9  static/css/pos_documentos.css
+bdf9196fe3da3241bbd198b3d92b309c275fb7d528c35d92e86cd432b49ae3f3  static/js/pos_documentos.js

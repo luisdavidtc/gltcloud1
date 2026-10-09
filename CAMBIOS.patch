@@ -1,0 +1,499 @@
+--- a/templates/sales/sale_form.html
++++ b/templates/sales/sale_form.html
+@@ -22,7 +22,11 @@
+     </div>
+ </div>
+ {% else %}
++{% url 'cotizaciones:pos_guardar' as pos_guardar_url %}
++{% url 'cotizaciones:pos_cliente' 0 as pos_cliente_url %}
+ <form method="post" id="ventaForm"
++      data-cotizacion-guardar-url="{{ pos_guardar_url }}"
++      data-cotizacion-cliente-url="{{ pos_cliente_url }}"
+       data-clientes-url="{% url 'sales:client_search' %}"
+       data-clientes-modal-url="{% url 'clients:client_modal_list' %}"
+       data-productos-url="{% url 'sales:product_search' %}"
+@@ -512,7 +516,7 @@
+ {% block extra_js %}
+ <script src="{% static 'js/pos_layout.js' %}"></script>
+ <script src="{% static 'js/cotizacion_toast.js' %}"></script>
+-<script src="{% static 'js/pos_documentos.js' %}"></script>
++<script src="{% static 'js/pos_documentos.js' %}?v=handlers-20261003-1"></script>
+ {% if not sin_caja_abierta %}
+ <script src="{% static 'js/clients_modal.js' %}"></script>
+ <script src="{% static 'js/sale_form.js' %}"></script>
+--- a/static/js/pos_documentos.js
++++ b/static/js/pos_documentos.js
+@@ -1,167 +1,281 @@
+-/* Documento activo independiente del flujo de cobro. Sin cambios en el carrito. */
++/* POS y Cotizaciones: eventos delegados, CSRF y guardado fuera del flujo de cobro. */
+ (function () {
+     'use strict';
+-    const form = document.getElementById('ventaForm');
+-    if (!form) return;
+-    // Un modal dentro de un ancestro transformado puede quedar bajo su backdrop.
+-    ['modalNuevoCliente','modalConfirmarVenta','posDetailModal'].forEach(id => {
+-        const el = document.getElementById(id); if (el) document.body.append(el);
+-    });
+-    const tipo = document.getElementById('posDocumentoTipo');
+-    const nombre = document.getElementById('posDocumentoNombre');
+-    const guardar = document.getElementById('posGuardarDocumento');
+-    const compartir = document.getElementById('posCompartirPanel');
+-    const mensaje = document.getElementById('posDocumentoMensaje');
+-    const validez = document.getElementById('posFechaValidez');
+-    const etiquetas = {pos:'POS',factura_electronica:'Facturación Electrónica',cotizacion:'Cotización',orden_venta:'Orden de Venta'};
+-    let busy = false, saved = null, savedSnapshot = '';
+-    const fecha = new Date(); fecha.setDate(fecha.getDate()+15);
+-    validez.value = [fecha.getFullYear(),String(fecha.getMonth()+1).padStart(2,'0'),String(fecha.getDate()).padStart(2,'0')].join('-');
+-    function avisar(texto) { mensaje.replaceChildren(document.createTextNode(texto)); }
+-    function urlLocal(value) {
+-        const url = new URL(value, location.origin);
+-        if (url.origin !== location.origin || !['http:','https:'].includes(url.protocol)) throw new Error('Ruta de documento no válida.');
+-        return url.href;
++    function init() {
++        document.querySelectorAll('[data-pos-history-toggle]').forEach(button => {
++            button.addEventListener('click', () => {
++                const card = button.closest('[data-pos-history-card]'); if (!card) return;
++                const collapsed = card.classList.toggle('is-collapsed');
++                button.setAttribute('aria-expanded', String(!collapsed));
++                button.title = collapsed ? 'Expandir tarjeta' : 'Minimizar tarjeta';
++                button.setAttribute('aria-label', button.title);
++                const extra = document.getElementById(button.getAttribute('aria-controls'));
++                if (extra) extra.setAttribute('aria-hidden', String(collapsed));
++                const icon = button.querySelector('i'); if (icon) icon.className = collapsed ? 'bi bi-chevron-down' : 'bi bi-chevron-up';
++            });
++        });
++        const form = document.getElementById('ventaForm');
++        if (!form || form.dataset.documentosHandlersReady === 'true') return;
++        form.dataset.documentosHandlersReady = 'true';
++        const tipo = document.getElementById('posDocumentoTipo');
++        const nombre = document.getElementById('posDocumentoNombre');
++        const guardar = document.getElementById('posGuardarDocumento');
++        const panel = document.getElementById('posCompartirPanel');
++        const mensaje = document.getElementById('posDocumentoMensaje');
++        const validez = document.getElementById('posFechaValidez');
++        if (!tipo || !guardar) {
++            console.error('[Cotizaciones] Plantilla incompatible: falta posDocumentoTipo/posGuardarDocumento.');
++            return;
++        }
++        ['modalNuevoCliente', 'modalConfirmarVenta', 'posDetailModal'].forEach(id => {
++            const el = document.getElementById(id); if (el && el.parentElement !== document.body) document.body.append(el);
++        });
++        const labels = {pos:'POS', factura_electronica:'Facturación Electrónica', cotizacion:'Cotización', orden_venta:'Orden de Venta'};
++        let busy = false, saved = null, savedSnapshot = '', contact = null, contactId = '', contactFlight = null;
++        let previousDisabled = new Map();
++        if (validez && !validez.value) {
++            const d = new Date(); d.setDate(d.getDate() + 15);
++            validez.value = [d.getFullYear(), String(d.getMonth()+1).padStart(2,'0'), String(d.getDate()).padStart(2,'0')].join('-');
++        }
++        function notice(text, success, toast) {
++            if (mensaje) mensaje.textContent = text;
++            if (!toast) return;
++            if (typeof window.CotizacionToast === 'function') window.CotizacionToast(text, !!success);
++            else {
++                // Un fallo al cargar el helper nunca debe detener un guardado ya realizado.
++                const box = document.createElement('div'); box.setAttribute('role', success ? 'status' : 'alert');
++                box.className = 'alert shadow ' + (success ? 'alert-success' : 'alert-warning');
++                box.textContent = (success ? '✓ ' : '⚠ ') + text;
++                Object.assign(box.style, {position:'fixed', bottom:'1rem', right:'1rem', zIndex:'1090', maxWidth:'90vw'});
++                box.addEventListener('click', () => box.remove()); document.body.append(box);
++                setTimeout(() => box.remove(), success ? 10000 : 20000);
++            }
++        }
++        function localURL(value) {
++            if (!value) throw new Error('La ruta no está configurada. Instala cotizaciones/urls.py del parche.');
++            const u = new URL(value, location.href);
++            if (u.origin !== location.origin || !['http:', 'https:'].includes(u.protocol)) throw new Error('Ruta de documento no válida.');
++            return u.href;
++        }
++        function csrf() {
++            const input = form.querySelector('[name="csrfmiddlewaretoken"]');
++            if (!input || !input.value) throw new Error('Falta el token CSRF. Recarga la página.');
++            return input.value;
++        }
++        async function json(url, options) {
++            const response = await fetch(localURL(url), Object.assign({credentials:'same-origin'}, options));
++            if (response.redirected) throw new Error('La sesión o los permisos requieren revisión. Recarga e inicia sesión.');
++            if (!(response.headers.get('content-type') || '').includes('application/json')) {
++                throw new Error(response.status === 403 ? 'Acceso rechazado (permisos o CSRF). Recarga la página.' :
++                    'El servidor no devolvió JSON (HTTP ' + response.status + '). Revisa las rutas y el registro de Django.');
++            }
++            const result = await response.json();
++            if (!response.ok) throw new Error(result.error || result.correo_error || 'Error HTTP ' + response.status);
++            return result;
++        }
++        function customerId() { const c = document.getElementById('id_cliente'); return c ? c.value : ''; }
++        function snapshot() {
++            const keys = ['cliente','fecha_validez','descuento_porcentaje','observaciones','producto_id','cantidad','precio_unitario','descuento_item'];
++            return JSON.stringify(Array.from(new FormData(form).entries()).filter(([key]) => keys.includes(key)));
++        }
++        function validate() {
++            if (!customerId()) throw new Error('Selecciona un cliente antes de guardar la cotización.');
++            const rows = Array.from(form.querySelectorAll('#itemsBody .item-fila'));
++            if (!rows.length) throw new Error('Agrega al menos un producto a la cotización.');
++            rows.forEach(row => {
++                const id = row.querySelector('[name="producto_id"]');
++                const qty = row.querySelector('[name="cantidad"]');
++                const price = row.querySelector('[name="precio_unitario"]');
++                if (!id || !id.value || !qty || !Number.isFinite(Number(qty.value)) || Number(qty.value) <= 0 ||
++                    !price || price.value === '' || !Number.isFinite(Number(price.value)) || Number(price.value) < 0) {
++                    throw new Error('Revisa producto, cantidad y precio de cada línea.');
++                }
++            });
++            if (!validez || !/^\d{4}-\d{2}-\d{2}$/.test(validez.value)) throw new Error('Selecciona la fecha de validez.');
++            const now = new Date();
++            const today = [now.getFullYear(),String(now.getMonth()+1).padStart(2,'0'),String(now.getDate()).padStart(2,'0')].join('-');
++            if (validez.value < today) throw new Error('La fecha de validez no puede estar en el pasado.');
++        }
++        async function selectedClient(force) {
++            const id = customerId();
++            if (!id) throw new Error('Selecciona un cliente.');
++            if (!force && contact && contactId === id) return contact;
++            if (contactFlight && contactFlight.id === id) return contactFlight.promise;
++            const template = form.dataset.cotizacionClienteUrl;
++            if (!template || !/\/0\//.test(template)) throw new Error('Falta la ruta para consultar el cliente seleccionado.');
++            const promise = json(template.replace(/\/0\//, '/' + encodeURIComponent(id) + '/')).then(data => {
++                if (customerId() !== id) throw new Error('El cliente cambió durante la consulta. Repite la acción.');
++                contact = data; contactId = id; return data;
++            });
++            contactFlight = {id, promise};
++            try { return await promise; } finally { if (contactFlight && contactFlight.promise === promise) contactFlight = null; }
++        }
++        function lock(active) {
++            if (active) {
++                previousDisabled = new Map();
++                document.querySelectorAll('[data-pos-documento], [data-pos-action], #posGuardarDocumento').forEach(b => {
++                    previousDisabled.set(b, b.disabled); b.disabled = true;
++                });
++                guardar.setAttribute('aria-busy', 'true');
++            } else {
++                previousDisabled.forEach((value, b) => { b.disabled = value; });
++                guardar.removeAttribute('aria-busy');
++            }
++        }
++        function update() {
++            if (nombre) nombre.textContent = labels[tipo.value] || 'POS';
++            tipo.disabled = tipo.value === 'pos';
++            guardar.textContent = tipo.value === 'pos' ? 'Confirmar Venta' : 'Guardar ' + (labels[tipo.value] || 'documento').toLowerCase();
++            if (panel) panel.hidden = !['cotizacion','orden_venta'].includes(tipo.value);
++            const wrap = document.getElementById('posValidezWrap'); if (wrap) wrap.hidden = tipo.value !== 'cotizacion';
++            // Los required ocultos no deben impedir el submit del POS antes de llegar al handler.
++            if (validez) validez.required = false;
++            document.querySelectorAll('[data-pos-documento]').forEach(b => {
++                b.classList.toggle('active', b.dataset.posDocumento === tipo.value);
++                b.setAttribute('aria-pressed', String(b.dataset.posDocumento === tipo.value));
++            });
++            notice(tipo.value === 'cotizacion' ? 'Cotización sin cobro ni movimientos de caja/inventario.' :
++                tipo.value === 'pos' ? 'Confirma la venta con el flujo de pagos existente.' : 'Este documento requiere su backend específico.', false, false);
++        }
++        function links() {
++            if (!mensaje || !saved) return;
++            ['pdf_url','detalle_url'].forEach((key, i) => {
++                const a = document.createElement('a'); a.href = localURL(saved[key]); a.target = '_blank'; a.rel = 'noopener';
++                a.textContent = i ? ' Ver cotización' : ' Descargar PDF'; mensaje.append(a);
++            });
++        }
++        async function ensureSaved(action) {
++            const signature = snapshot();
++            if (saved && savedSnapshot === signature) return false;
++            const body = new FormData(form);
++            body.set('tipo_documento', 'cotizacion'); body.set('accion_documento', action);
++            const result = await json(form.dataset.cotizacionGuardarUrl, {
++                method:'POST', body, headers:{'X-Requested-With':'XMLHttpRequest', 'X-CSRFToken':csrf()}
++            });
++            if (!result.id || !result.codigo) throw new Error('Respuesta de guardado incompleta. Revisa el historial antes de repetir.');
++            saved = result; savedSnapshot = signature;
++            if (snapshot() !== signature) throw new Error('Se guardó ' + result.codigo + ', pero cambiaste el carrito durante el guardado. Revisa el documento antes de enviarlo.');
++            return true;
++        }
++        function phoneNumber(value) {
++            const raw = String(value || '').trim();
++            let digits = raw.replace(/\D/g, '');
++            if (raw.startsWith('00')) digits = digits.slice(2);
++            // ERP colombiano: móvil nacional; otras regiones deben registrar prefijo internacional.
++            if (/^3\d{9}$/.test(digits)) digits = '57' + digits;
++            if (!/^[1-9]\d{7,14}$/.test(digits)) throw new Error('Registra un teléfono válido con código de país para el cliente.');
++            return digits;
++        }
++        async function execute(action) {
++            if (busy) return;
++            if (tipo.value === 'pos') {
++                if (action === 'guardar') {
++                    const button = document.getElementById('btnGuardar'); if (button) button.click();
++                }
++                return;
++            }
++            if (tipo.value !== 'cotizacion') {
++                notice('La emisión de este tipo de documento aún no está conectada. No se registró una venta.', false, true); return;
++            }
++            let popup = null;
++            // Abrir durante el clic evita que el navegador bloquee la pestaña tras await.
++            if (['pdf','whatsapp'].includes(action)) { popup = window.open('about:blank', '_blank'); if (popup) popup.opener = null; }
++            busy = true; lock(true);
++            try {
++                validate();
++                notice('Procesando cotización…', false, false);
++                const currentId = customerId();
++                let client = null, phone = null;
++                if (action === 'correo' || action === 'whatsapp') {
++                    client = await selectedClient(true);
++                    if (action === 'correo' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(client.email || '')) throw new Error('El cliente no tiene un correo válido registrado.');
++                    if (action === 'whatsapp') phone = phoneNumber(client.telefono);
++                }
++                if (customerId() !== currentId) throw new Error('El cliente cambió. Repite la acción.');
++                const created = await ensureSaved(action);
++                let text = 'Cotización ' + saved.codigo + ' guardada con éxito.';
++                let success = true;
++                if (action === 'correo' && !created) {
++                    const body = new FormData(); body.set('csrfmiddlewaretoken', csrf());
++                    const result = await json(saved.correo_url, {method:'POST', body,
++                        headers:{'X-Requested-With':'XMLHttpRequest', 'X-CSRFToken':csrf()}});
++                    Object.assign(saved, result);
++                }
++                if (action === 'correo' || (created && action === 'guardar')) {
++                    success = !!saved.correo_enviado;
++                    text = saved.correo_enviado ? 'Cotización ' + saved.codigo + ' guardada y enviada con éxito al correo del cliente ' + saved.correo_destinatario :
++                        'Cotización ' + saved.codigo + ' guardada. ' + (saved.correo_error || 'No se confirmó el envío. Reintenta con Enviar por Correo.');
++                }
++                if (action === 'pdf') {
++                    const dest = new URL(localURL(saved.pdf_url)); dest.searchParams.set('imprimir','1');
++                    if (popup) popup.location.replace(dest.href);
++                    text += ' PDF listo para imprimir desde el visor del navegador.';
++                    if (!popup) text += ' Permite ventanas emergentes o usa Descargar PDF.';
++                }
++                if (action === 'whatsapp') {
++                    const total = Number(saved.total);
++                    const amount = Number.isFinite(total) ? new Intl.NumberFormat('es-CO', {style:'currency',currency:'COP'}).format(total) : String(saved.total);
++                    const message = 'Hola ' + client.nombre + ', te compartimos los detalles de tu cotización ' + saved.codigo + ' por un valor de ' + amount + '. ¡Gracias por preferirnos!';
++                    const dest = 'https://wa.me/' + phone + '?text=' + encodeURIComponent(message);
++                    if (popup) popup.location.replace(dest);
++                    else if (mensaje) {
++                        const a = document.createElement('a'); a.href = dest; a.target = '_blank'; a.rel = 'noopener'; a.textContent = 'Abrir WhatsApp';
++                        notice(text, true, true); mensaje.append(a); links(); return;
++                    }
++                    text += ' Adjunta el PDF manualmente en WhatsApp; el enlace abre un mensaje, no envía archivos.';
++                }
++                notice(text, success, true); links();
++            } catch (error) {
++                if (popup) popup.close();
++                console.error('[Cotizaciones] Fallo de acción:', action, error);
++                notice(error.message || 'No se pudo completar la operación.', false, true);
++                if (saved) links();
++            } finally { busy = false; lock(false); }
++        }
++        // Delegación: clic en iconos/textos y controles renderizados posteriormente.
++        document.addEventListener('click', e => {
++            const target = e.target instanceof Element ? e.target.closest('[data-pos-documento], [data-pos-action], #posGuardarDocumento') : null;
++            if (!target || target.disabled) return;
++            if (target.matches('[data-pos-documento]')) {
++                e.preventDefault();
++                if (busy || document.querySelector('.modal.show')) return;
++                if (!labels[target.dataset.posDocumento]) return;
++                tipo.value = target.dataset.posDocumento; update();
++                const dropdown = document.getElementById('posDocumentoSelector');
++                if (window.bootstrap && dropdown) window.bootstrap.Dropdown.getOrCreateInstance(dropdown).hide();
++            } else {
++                e.preventDefault(); e.stopImmediatePropagation();
++                execute(target.dataset.posAction || 'guardar');
++            }
++        }, true);
++        form.addEventListener('submit', e => {
++            if (tipo.value === 'pos') {
++                tipo.disabled = true;
++                const modal = document.getElementById('modalConfirmarVenta');
++                if (modal && modal.classList.contains('show') && form.querySelector('#pagosHiddenInputs [name=pago_metodo]')) return;
++            }
++            e.preventDefault(); e.stopImmediatePropagation(); execute('guardar');
++        }, true);
++        document.addEventListener('keydown', e => {
++            if (tipo.value === 'pos' || document.querySelector('.modal.show')) return;
++            if (e.key === 'F9' || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's')) {
++                e.preventDefault(); e.stopImmediatePropagation(); execute('guardar');
++            }
++        }, true);
++        document.addEventListener('click', e => {
++            const target = e.target instanceof Element ? e.target.closest('#btnGuardar, #modalConfirmarVenta button') : null;
++            if (tipo.value !== 'pos' && target && !target.matches('[data-bs-dismiss]')) {
++                e.preventDefault(); e.stopImmediatePropagation(); execute('guardar');
++            }
++        }, true);
++        const modal = document.getElementById('modalConfirmarVenta');
++        if (modal) modal.addEventListener('show.bs.modal', e => { if (tipo.value !== 'pos') e.preventDefault(); });
++        // No reinicializar id_cliente al cambiar tipo de documento.
++        const select = document.getElementById('id_cliente');
++        if (select) select.addEventListener('change', () => { contact = null; contactId = ''; });
++        tipo.value = 'pos'; update();
++        form.dataset.documentosHandlersVersion = 'handlers-20261003-1';
+     }
+-    function snapshot() {
+-        return JSON.stringify(Array.from(new FormData(form).entries()).filter(([key]) =>
+-            ['cliente','fecha_validez','descuento_porcentaje','observaciones','producto_id','cantidad','precio_unitario','descuento_item','tipo_documento'].includes(key)));
+-    }
+-    function actualizar() {
+-        nombre.textContent = etiquetas[tipo.value];
+-        tipo.disabled = tipo.value === 'pos'; // POS utiliza el POST de venta existente.
+-        guardar.textContent = tipo.value === 'pos' ? 'Confirmar Venta' : 'Guardar ' + etiquetas[tipo.value].toLowerCase();
+-        compartir.hidden = !['cotizacion','orden_venta'].includes(tipo.value);
+-        document.getElementById('posValidezWrap').hidden = tipo.value !== 'cotizacion';
+-        document.querySelectorAll('[data-pos-documento]').forEach(b => {
+-            b.classList.toggle('active', b.dataset.posDocumento === tipo.value);
+-            b.setAttribute('aria-pressed', String(b.dataset.posDocumento === tipo.value));
+-        });
+-        avisar(tipo.value === 'pos' ? 'Confirma la venta con el flujo de pagos existente.' : tipo.value === 'cotizacion' ? 'Se guarda sin cobrar, descontar inventario ni afectar caja.' :
+-            'Tipo seleccionado. Su emisión no está conectada en este parche; no se registrará como venta.');
+-    }
+-    document.querySelectorAll('[data-pos-documento]').forEach(b => b.addEventListener('click', () => {
+-        if (busy || b.disabled) return;
+-        const pagoModal = document.getElementById('modalConfirmarVenta');
+-        if (pagoModal && pagoModal.classList.contains('show')) return;
+-        if (document.querySelector('.modal.show')) return;
+-        const dropdown = document.getElementById('posDocumentoSelector');
+-        if (window.bootstrap && dropdown) bootstrap.Dropdown.getOrCreateInstance(dropdown).hide();
+-        // No reinicializar cliente, carrito o documento guardado al cambiar el tipo.
+-        tipo.value = b.dataset.posDocumento; actualizar();
+-    }));
+-    async function ejecutar(accion) {
+-        if (busy) return;
+-        if (tipo.value === 'pos') {
+-            if (accion !== 'guardar') return;
+-            document.getElementById('btnGuardar').click();
+-            return;
+-        }
+-        if (tipo.value !== 'cotizacion') {
+-            avisar('Este tipo de documento requiere su backend específico. Operación bloqueada: no se registró una venta.'); return;
+-        }
+-        if (!document.getElementById('id_cliente').value || !form.querySelector('#itemsBody .item-fila')) {
+-            avisar('Selecciona un cliente y agrega al menos un producto.'); return;
+-        }
+-        let wa = null, popup = null;
+-        if (accion === 'whatsapp') {
+-            const telefono = window.prompt('Número de WhatsApp con código de país, por ejemplo 573001234567:');
+-            if (telefono === null) return;
+-            wa = telefono.replace(/\D/g,'');
+-            if (!/^\d{8,15}$/.test(wa)) { avisar('Número de WhatsApp no válido.'); return; }
+-        }
+-        if (['pdf','whatsapp'].includes(accion)) {
+-            popup = window.open('about:blank','_blank');
+-            if (popup) popup.opener = null;
+-        }
+-        busy = true;
+-        document.querySelectorAll('[data-pos-documento], [data-pos-action], #posGuardarDocumento').forEach(b => b.disabled = true);
+-        try {
+-            const firma = snapshot();
+-            let recienGuardada = false;
+-            if (!saved || savedSnapshot !== firma) {
+-                const body = new FormData(form); body.set('accion_documento',accion);
+-                const response = await fetch(form.action || location.href, {method:'POST',body,credentials:'same-origin',headers:{'X-Requested-With':'XMLHttpRequest'}});
+-                if (response.redirected || !(response.headers.get('content-type') || '').includes('application/json')) throw new Error('Respuesta inesperada. Comprueba la sesión y que sales/views.py tenga instalado el adaptador del parche.');
+-                const result = await response.json();
+-                if (!response.ok) throw new Error(result.error || 'No se pudo guardar el documento.');
+-                saved = result; savedSnapshot = firma; recienGuardada = true;
+-                const texto = saved.correo_enviado ?
+-                    'Cotización guardada y enviada con éxito al correo del cliente ' + saved.correo_destinatario :
+-                    'Cotización guardada. ' + (saved.correo_error || 'No se pudo enviar el correo.');
+-                window.CotizacionToast(texto, !!saved.correo_enviado);
+-            }
+-            avisar(saved.codigo + ' guardada. ' + (saved.correo_enviado ? 'Enviada al correo ' + saved.correo_destinatario + '.' : (saved.correo_error || 'Correo pendiente de envío.')));
+-            const pdf = document.createElement('a'); pdf.href=urlLocal(saved.pdf_url); pdf.target='_blank';pdf.rel='noopener';pdf.textContent='Descargar PDF';
+-            const detalle=document.createElement('a');detalle.href=urlLocal(saved.detalle_url);detalle.target='_blank';detalle.rel='noopener';detalle.textContent='Ver cotización';
+-            mensaje.append(document.createElement('br'),pdf,detalle);
+-            if (accion === 'pdf') {
+-                const destino = urlLocal(saved.pdf_url) + '?imprimir=1';
+-                if (popup) popup.location.replace(destino); else avisar('Cotización guardada. Permite ventanas emergentes o usa el PDF desde el detalle.');
+-            } else if (accion === 'correo' && !recienGuardada) {
+-                const body = new FormData();
+-                body.set('csrfmiddlewaretoken', form.querySelector('[name=csrfmiddlewaretoken]').value);
+-                const response = await fetch(urlLocal(saved.correo_url), {method:'POST',body,credentials:'same-origin',headers:{'X-Requested-With':'XMLHttpRequest'}});
+-                if (response.redirected || !(response.headers.get('content-type') || '').includes('application/json')) throw new Error('No se pudo enviar: comprueba tu sesión y permisos.');
+-                const result = await response.json();
+-                Object.assign(saved, result);
+-                const text = result.correo_enviado ? 'Cotización enviada con éxito al correo del cliente ' + result.correo_destinatario : (result.correo_error || result.error || 'No se pudo enviar el correo.');
+-                avisar(text); window.CotizacionToast(text, !!result.correo_enviado);
+-            } else if (accion === 'whatsapp') {
+-                const texto='Hola, te comparto la cotización '+saved.codigo+'. Te adjunto el PDF.';
+-                const destino='https://wa.me/'+wa+'?text='+encodeURIComponent(texto);
+-                if (popup) popup.location.replace(destino);
+-                else {const link=document.createElement('a');link.href=destino;link.target='_blank';link.rel='noopener';link.textContent='Abrir WhatsApp';mensaje.append(link);}
+-                mensaje.append(document.createTextNode(' Descarga el PDF y adjúntalo manualmente al chat. No se comparte un enlace privado del ERP.'));
+-            }
+-        } catch (error) {
+-            if (popup) popup.close(); avisar(error.message || 'No se pudo completar la operación.');
+-        } finally {
+-            busy=false;document.querySelectorAll('[data-pos-documento], [data-pos-action], #posGuardarDocumento').forEach(b => b.disabled=b.dataset.posModuleDisabled === 'true');
+-        }
+-    }
+-    guardar.addEventListener('click', () => ejecutar('guardar'));
+-    document.querySelectorAll('[data-pos-action]').forEach(b => b.addEventListener('click', () => ejecutar(b.dataset.posAction)));
+-    // Captura anterior al script legado: Enter/F9/Ctrl+S nunca deben cobrar documentos.
+-    form.addEventListener('submit', e => {
+-        if (tipo.value === 'pos') {
+-            tipo.disabled = true;
+-            const modal = document.getElementById('modalConfirmarVenta');
+-            if (modal && modal.classList.contains('show') && form.querySelector('#pagosHiddenInputs [name=pago_metodo]')) return;
+-        }
+-        e.preventDefault();e.stopImmediatePropagation();ejecutar('guardar');
+-    }, true);
+-    document.addEventListener('keydown', e => {
+-        if (document.querySelector('.modal.show')) return;
+-        if (e.key==='F9' || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase()==='s')) {
+-            e.preventDefault(); e.stopImmediatePropagation(); ejecutar('guardar');
+-        }
+-    }, true);
+-    document.addEventListener('click', e => {
+-        const target=e.target.closest('#btnGuardar, #modalConfirmarVenta button');
+-        if (tipo.value !== 'pos' && target && !target.matches('[data-bs-dismiss]')) {e.preventDefault();e.stopImmediatePropagation();ejecutar('guardar');}
+-    },true);
+-    const modal=document.getElementById('modalConfirmarVenta');
+-    if (modal) modal.addEventListener('show.bs.modal', e => { if (tipo.value !== 'pos') e.preventDefault(); });
+-    document.querySelectorAll('[data-pos-documento][disabled]').forEach(b => b.dataset.posModuleDisabled = 'true');
+-    tipo.value = 'pos';
+-    actualizar();
++    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, {once:true});
++    else init();
+ })();
+-
+-// Funciona también si la caja está cerrada y no se renderiza ventaForm.
+-(function () {
+-    'use strict';
+-    document.querySelectorAll('[data-pos-history-toggle]').forEach(button => {
+-        button.addEventListener('click', () => {
+-            const card = button.closest('[data-pos-history-card]');
+-            const collapsed = card.classList.toggle('is-collapsed');
+-            button.setAttribute('aria-expanded', String(!collapsed));
+-            button.title = collapsed ? 'Expandir tarjeta' : 'Minimizar tarjeta';
+-            button.setAttribute('aria-label', button.title);
+-            const extra = document.getElementById(button.getAttribute('aria-controls'));
+-            if (extra) extra.setAttribute('aria-hidden', String(collapsed));
+-            button.querySelector('i').className = collapsed ? 'bi bi-chevron-down' : 'bi bi-chevron-up';
+-        });
+-    });
+-})();
+-
+--- a/sales/pos_documentos.py
++++ b/sales/pos_documentos.py
+@@ -66,8 +66,11 @@
+             return JsonResponse({'error':' '.join(errores) or 'Corrige los datos del documento.'}, status=400)
+         cot = guardar(request, form, detalles)
+         from cotizaciones.correo import intentar_envio
+-        resultado_correo = intentar_envio(request, cot)
+-        return JsonResponse({'id':cot.pk, 'codigo':cot.codigo,
++        accion = request.POST.get('accion_documento', 'guardar')
++        resultado_correo = (intentar_envio(request, cot) if accion in ('guardar', 'correo') else
++            {'correo_enviado': False, 'correo_destinatario': '', 'correo_error': '', 'correo_omitido': True})
++        return JsonResponse({'id':cot.pk, 'codigo':cot.codigo, 'total':str(cot.total),
++            'fecha_validez':str(cot.fecha_validez), 'cliente_id':cot.cliente_id,
+             'detalle_url':reverse('cotizaciones:detalle', kwargs={'pk':cot.pk}),
+             'pdf_url':reverse('cotizaciones:pdf', kwargs={'pk':cot.pk}),
+             'correo_url':reverse('cotizaciones:enviar', kwargs={'pk':cot.pk}),
+--- a/cotizaciones/urls.py
++++ b/cotizaciones/urls.py
+@@ -1,7 +1,9 @@
+ from django.urls import path
+-from . import views
++from . import views, pos_api
+ app_name = 'cotizaciones'
+ urlpatterns = [
++    path('pos/guardar/', pos_api.guardar, name='pos_guardar'),
++    path('pos/cliente/<int:pk>/', pos_api.cliente, name='pos_cliente'),
+     path('', views.listado, name='listado'),
+     path('nueva/', views.crear, name='crear'),
+     path('productos/', views.productos, name='productos'),

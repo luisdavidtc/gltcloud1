@@ -1,0 +1,4 @@
+Pruebas puras ejecutadas: 7; fallos: 0; errores: 0
+Django no está instalado: suite de integración pendiente.
+Sintaxis AST y bloques de plantillas: correctos.
+Pruebas Django escritas: 27, no ejecutadas.

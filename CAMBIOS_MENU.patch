@@ -1,0 +1,100 @@
+--- a/templates/base.html
++++ b/templates/base.html
+@@ -21,6 +21,29 @@
+     <!-- Estilos propios -->
+     <link href="{% static 'css/styles.css' %}" rel="stylesheet">
+     <link href="{% static 'css/loading.css' %}" rel="stylesheet">
++    <!-- Estilos locales del submenú: no alteran POS, Bootstrap ni otros menús. -->
++    <style>
++        #erpSidebar .erp-documentos-trigger {
++            width: 100%; border: 0; text-align: left;
++            font: inherit; display: flex; align-items: center;
++            justify-content: space-between; background: transparent;
++        }
++        #erpSidebar .erp-documentos-trigger .erp-submenu-caret {
++            margin-left: auto; font-size: .85rem;
++            transition: transform .2s ease;
++        }
++        #erpSidebar .erp-documentos-trigger[aria-expanded="true"] .erp-submenu-caret { transform: rotate(180deg); }
++        #erpSidebar .erp-documentos-trigger:focus-visible { outline: 2px solid #2dd4bf; outline-offset: -2px; }
++        #submenuDocumentos .nav-link { display: flex; align-items: center; gap: .55rem; }
++        #submenuDocumentos .erp-documentos-status { width: 8px; height: 8px; flex: 0 0 8px; border-radius: 50%; margin-left: auto; }
++        #submenuDocumentos .erp-documentos-status-on { background: #34d399; }
++        #submenuDocumentos .erp-documentos-status-off { background: #ef4444; }
++        #submenuDocumentos [aria-disabled="true"] { cursor: not-allowed; }
++        @media (prefers-reduced-motion: reduce) {
++            #erpSidebar .erp-documentos-trigger .erp-submenu-caret,
++            #submenuDocumentos.collapsing { transition: none; }
++        }
++    </style>
+     {% if branding_config and branding_config.favicon %}
+     <link rel="icon" href="{{ branding_config.favicon.url }}">
+     {% else %}
+@@ -67,12 +90,61 @@
+                 <i class="bi bi-speedometer2"></i> <span class="erp-nav-text">Dashboard</span>
+             </a>
+ 
+-            {# ===================== FACTURACIÓN ===================== #}
+-            {% if user.es_admin or user.role == 'vendedor' %}{% if 'ventas' in modulos_activos_codigos %}
+-            <a href="{% url 'sales:sale_create' %}" class="nav-link {% if seccion_activa == 'ventas' %}active{% endif %}">
+-                <i class="bi bi-shop"></i> <span class="erp-nav-text">POS</span>
+-            </a>
+-            {% endif %}{% endif %}
++            {# Ventas y documentos: reutiliza los flags centrales del ERP. #}
++            {% if user.es_admin or user.role == 'vendedor' or request.rol_en_empresa == 'admin' or user.is_superuser %}
++            {% with ns=request.resolver_match.namespace vista=request.resolver_match.view_name codigo=request.resolver_match.kwargs.codigo %}
++            <button type="button" data-bs-toggle="collapse" data-bs-target="#submenuDocumentos"
++                    aria-controls="submenuDocumentos"
++                    aria-expanded="{% if ns == 'sales' or ns == 'cotizaciones' or codigo == 'factura-electronica' %}true{% else %}false{% endif %}"
++                    class="nav-link erp-documentos-trigger {% if ns == 'sales' or ns == 'cotizaciones' or codigo == 'factura-electronica' %}erp-submenu-parent-active{% endif %}">
++                <span class="erp-nav-label"><i class="bi bi-receipt"></i> <span class="erp-nav-text">Ventas y documentos</span></span>
++                <i class="bi bi-chevron-down erp-submenu-caret" aria-hidden="true"></i>
++            </button>
++            <div id="submenuDocumentos" class="collapse erp-submenu {% if ns == 'sales' or ns == 'cotizaciones' or codigo == 'factura-electronica' %}show{% endif %}">
++                <nav class="nav flex-column" aria-label="Ventas y documentos">
++                    {% if 'ventas' in modulos_activos_codigos %}
++                    <a href="{% url 'sales:sale_create' %}" class="nav-link {% if ns == 'sales' %}active{% endif %}" {% if ns == 'sales' %}aria-current="page"{% endif %}>
++                        <i class="bi bi-shop"></i> <span class="erp-nav-text">Venta POS</span>
++                    </a>
++                    {% endif %}
++
++                    {% if 'facturacion' in modulos_activos_codigos %}
++                    <a href="{% url 'core:en_desarrollo' 'factura-electronica' %}"
++                       class="nav-link {% if codigo == 'factura-electronica' %}active{% endif %}"
++                       title="Módulo activo; integración DIAN en desarrollo"
++                       {% if codigo == 'factura-electronica' %}aria-current="page"{% endif %}>
++                        <i class="bi bi-file-earmark-check"></i>
++                        <span class="erp-nav-text">Factura electrónica</span>
++                        <span class="erp-documentos-status erp-documentos-status-on" aria-hidden="true"></span>
++                        <span class="visually-hidden">Módulo activo; integración DIAN en desarrollo.</span>
++                    </a>
++                    {% else %}
++                    <span class="nav-link erp-disabled" aria-disabled="true" title="Facturación electrónica desactivada para esta empresa">
++                        <i class="bi bi-file-earmark-check"></i>
++                        <span class="erp-nav-text">Factura electrónica</span>
++                        <span class="erp-documentos-status erp-documentos-status-off" aria-hidden="true"></span>
++                        <span class="visually-hidden">Módulo inactivo.</span>
++                    </span>
++                    {% endif %}
++
++                    {% if 'cotizaciones' in modulos_activos_codigos %}
++                    {% if perms.cotizaciones.view_cotizacion or request.rol_en_empresa == 'admin' or user.is_superuser %}
++                    {% url 'cotizaciones:listado' as cotizaciones_url %}
++                    {% if cotizaciones_url %}
++                    <a href="{{ cotizaciones_url }}" class="nav-link {% if ns == 'cotizaciones' %}active{% endif %}" {% if ns == 'cotizaciones' %}aria-current="page"{% endif %}>
++                        <i class="bi bi-file-earmark-text"></i> <span class="erp-nav-text">Cotizaciones</span>
++                    </a>
++                    {% else %}
++                    <span class="nav-link erp-disabled" aria-disabled="true" title="Registra cotizaciones.urls en las URLs del proyecto">
++                        <i class="bi bi-file-earmark-text"></i> <span class="erp-nav-text">Cotizaciones</span>
++                        <span class="visually-hidden">Ruta pendiente de integración.</span>
++                    </span>
++                    {% endif %}
++                    {% endif %}{% endif %}
++                </nav>
++            </div>
++            {% endwith %}
++            {% endif %}
+ 
+             {# ===================== INVENTARIO ===================== #}
+             {% if user.es_admin %}{% if 'inventario' in modulos_activos_codigos %}

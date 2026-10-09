@@ -1,0 +1,122 @@
+[
+  {
+    "archivo": "cashregister/denominations.py",
+    "original_sha256": null,
+    "corregido_sha256": "7032702b545792f5f60c82faec5b94b4db4afea5ae84651b68bf213925e93ede"
+  },
+  {
+    "archivo": "cashregister/daily.py",
+    "original_sha256": null,
+    "corregido_sha256": "8aa2e8437acb0086127422a29b7de86e6267e01bfcbb46d66876e6b790fee3be"
+  },
+  {
+    "archivo": "cashregister/middleware.py",
+    "original_sha256": null,
+    "corregido_sha256": "d22998c9c51ce323ecf0f1ceb3e71ef5ead46f0a019b3dd94de13ad8c24ff4e5"
+  },
+  {
+    "archivo": "erp_config/settings.py",
+    "original_sha256": "6315c1be676263513fe1947273ee5f851b1f2a6a71fefb0d1716924ba956b3b7",
+    "corregido_sha256": "76adaa263e9c1a7bfaaba7ee66057565e844277345f5c012c45a988a5fc693d3"
+  },
+  {
+    "archivo": "cashregister/models.py",
+    "original_sha256": "f1e6856ac6b95770abd06d9353af90edc8be1d3957809469702ba3a69f0a5376",
+    "corregido_sha256": "b46328f5ecc644daaf95b992f97bf705df85886fae47505955edb48cc9889963"
+  },
+  {
+    "archivo": "cashregister/forms.py",
+    "original_sha256": "e081065cc4dc117b0df068bab4506bf531d5cfb0cdbaefeeed989b0a2c1698dd",
+    "corregido_sha256": "a1070b446a91405e1159fcb49a9c33e77b302e70c22258d87e110a6da5104f68"
+  },
+  {
+    "archivo": "cashregister/services.py",
+    "original_sha256": "dfcbd49031a39d1349937346993fa11fdefd22c71fbe1a0adbe0077233d5d195",
+    "corregido_sha256": "977114342281e1a208c21cfb4289d0b1e38d04ad29cc8820d356ff254cd05326"
+  },
+  {
+    "archivo": "cashregister/context_processors.py",
+    "original_sha256": "5431749128ef7a80673471ef3137522f9fde78ba0efc2ccae98d555cdc1e3b10",
+    "corregido_sha256": "6471fea7b70b64984a1f97dd6b61b7f76f88fc880fcb80d72d161f8943bc77dd"
+  },
+  {
+    "archivo": "cashregister/views.py",
+    "original_sha256": "78f7b44897e8767f61fe4c4d76d3cf54d0cebfbb7ad6bdcaa8b91472c90818c2",
+    "corregido_sha256": "069dfa1a8465824bbd61cea54c8c687460c32d8382277d70ff9b00429a13e64a"
+  },
+  {
+    "archivo": "sales/models.py",
+    "original_sha256": "0842b6743aafb63ee0a1eeaf3773b9d299045e29e061798b0dc68c61dbb738b8",
+    "corregido_sha256": "7560afd57dfa3c128d2999f582885458fafe735316fc3b0c8f96369f4da982ae"
+  },
+  {
+    "archivo": "purchases/services.py",
+    "original_sha256": "88978722c54a4798376efeaf3c76db61a14e5127614f7d9f8c92999414d049d4",
+    "corregido_sha256": "6ac273b4533f579382931459d996ecd80ce405cbcb41a8a34bcd4226d6bbee45"
+  },
+  {
+    "archivo": "templates/cashregister/_denominations.html",
+    "original_sha256": null,
+    "corregido_sha256": "02c77437d04628222d1e099953dd124d86ecf7ebd081e6133f721265153a18eb"
+  },
+  {
+    "archivo": "cashregister/templatetags/__init__.py",
+    "original_sha256": null,
+    "corregido_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "archivo": "cashregister/templatetags/cash_denominations.py",
+    "original_sha256": null,
+    "corregido_sha256": "31ce27dea196e55ae127814c912768dea76b85e1cb4845490da0a7058fb80b4a"
+  },
+  {
+    "archivo": "static/js/cash_denominations.js",
+    "original_sha256": null,
+    "corregido_sha256": "3d5257f4bc5978af450c1b7e9a86087dc1cf63ac9dac19f39d5095e253ec4b32"
+  },
+  {
+    "archivo": "templates/base.html",
+    "original_sha256": "b288df7f76102e7a52f1f3cbb166f8af38bdbca9fc4088fe61fbe38dd4ae6a87",
+    "corregido_sha256": "841a173e5eaeef2c88a4301acd1422c6505e324f28026bd71646ba13512a1a4a"
+  },
+  {
+    "archivo": "static/js/cash_register.js",
+    "original_sha256": "61ab70cc43e629504dba16cc1150276678d134debe43a6768a317bee73561329",
+    "corregido_sha256": "96064c6f54274183924dccd9da839da24f295de5786a7130cab95c015ec5e35c"
+  },
+  {
+    "archivo": "templates/cashregister/session_confirm_close.html",
+    "original_sha256": "a9c312a20d197c841878c4ac79f219a48022ca115ad197cbba8e8e87c9ac2a9e",
+    "corregido_sha256": "d3d818f0567c3351af4aa99b0918db7c4a2444239da9e99f720fb708a88cc7ec"
+  },
+  {
+    "archivo": "templates/cashregister/session_detail.html",
+    "original_sha256": "4d614a41cab56358f4d8c85c39f73a4eb49cce66ab4d19b99878a2cab8cf105f",
+    "corregido_sha256": "021539043865b584e378d7445c5d339ef831fddbe9f13362a41c6afd21dbe501"
+  },
+  {
+    "archivo": "templates/cashregister/session_close_ticket.html",
+    "original_sha256": "7ff2309a7f0d4fea5870c3f6f36baf0daaf1b046e10689920302667b5acf3516",
+    "corregido_sha256": "92ffaef57dc54efed109c862ccc7cc9c703a75b8c9e74cfade8db93d70d8c7b2"
+  },
+  {
+    "archivo": "cashregister/pdf.py",
+    "original_sha256": "e0c2f2d2e7c7a7b06d17b2a37582e73ae5ed6d34f9e41af8bb3a935879c61c8b",
+    "corregido_sha256": "0add2b5a5d2849390bfa26e75cf2791b9a50f0d47db04814c22ddb536114ea44"
+  },
+  {
+    "archivo": "cashregister/migrations/0010_daily_cash_and_denominations.py",
+    "original_sha256": null,
+    "corregido_sha256": "a4329775e8992405da814b973ce198ea18e5beb5b78fe1da5538be22cb21a2b1"
+  },
+  {
+    "archivo": "cashregister/test_daily_cash.py",
+    "original_sha256": null,
+    "corregido_sha256": "125aca4e950c64b70a137a1b4cf58de4c6eae067abf834ddbfde60b278b4cb79"
+  },
+  {
+    "archivo": "cashregister/test_denominations_pure.py",
+    "original_sha256": null,
+    "corregido_sha256": "b9c8a139ab09b3c47476dadaf2632baf4e5cc83f6e5808684c27172d0ee1ac46"
+  }
+]

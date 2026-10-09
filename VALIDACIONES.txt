@@ -1,0 +1,6 @@
+AST Python: OK
+Bloques de plantilla: balanceados
+5 pruebas aisladas endpoint: OK
+7 pruebas aisladas correo anterior: OK
+JavaScript: revisión estática; ejecución pendiente
+Django/browser/SMTP: pendientes
